@@ -92,11 +92,23 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				if _, err := os.Stat(reportJSONPath); err == nil {
-					// Report is generated
-					log.Printf("[+] Analysis complete!")
-					printSummary(reportJSONPath)
-					return
+				status, err := orch.GetJobStatus(jobID)
+				if err != nil {
+					log.Printf("[!] Warning: failed to check job status: %v", err)
+					continue
+				}
+
+				switch status {
+				case "failed":
+					log.Fatalf("[-] Analysis failed. This usually occurs when lacking elevated context required for real-time kernel-level harvesters (ETW/eBPF). Please run as Administrator or root.")
+				case "completed", "timeout":
+					if _, err := os.Stat(reportJSONPath); err == nil {
+						log.Printf("[+] Analysis complete (status: %s)!", status)
+						printSummary(reportJSONPath)
+						return
+					} else if status == "timeout" {
+						log.Fatalf("[-] Analysis timeout and no report was generated.")
+					}
 				}
 			case <-timeout:
 				log.Fatalf("[-] Analysis timed out waiting for reports.")

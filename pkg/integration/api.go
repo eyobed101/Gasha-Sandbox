@@ -94,15 +94,10 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	jobID := parts[2]
 
-	// In a real EDR system we'd load job status from database
-	// For status API, we can parse job status details directly from SQLite via the orchestrator.
-	// Since orchestrator doesn't expose the store publicly, let's look up files.
-	// Alternatively, we can check if report files exist.
-	jsonReportPath := filepath.Join(s.reportsDir, jobID, "report.json")
-	
-	status := "running"
-	if _, err := os.Stat(jsonReportPath); err == nil {
-		status = "completed"
+	status, err := s.orch.GetJobStatus(jobID)
+	if err != nil {
+		http.Error(w, "Job not found: "+err.Error(), http.StatusNotFound)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")

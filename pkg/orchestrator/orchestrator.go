@@ -52,6 +52,14 @@ func (o *Orchestrator) Close() {
 	o.store.Close()
 }
 
+func (o *Orchestrator) GetJobStatus(jobID string) (string, error) {
+	job, err := o.store.GetJob(jobID)
+	if err != nil {
+		return "", err
+	}
+	return job.Status, nil
+}
+
 func (o *Orchestrator) SubmitJob(filePath string) (string, error) {
 	hash, fileType, err := analyzeFileStatic(filePath)
 	if err != nil {
