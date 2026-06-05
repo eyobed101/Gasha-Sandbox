@@ -171,10 +171,6 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 		bus.StopPipeline()
 		return
 	}
-
-	// Inject simulated events (for test samples)
-	monitor.InjectSimulatedEvents(job.ID, filepath.Base(job.FilePath), publishChan)
-
 	// --- STEP 5: Wait for process termination ---
 	var exitCode int
 	doneChan := make(chan struct{})
