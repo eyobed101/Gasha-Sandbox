@@ -1,0 +1,66 @@
+{
+  "schema_version": "1.0",
+  "job_id": "b9769ab7-17f3-b262-ca04-09269130640a",
+  "analysis_metadata": {
+    "analysis_engine_version": "1.0.0",
+    "completed_at": "2026-06-05T14:10:43+03:00",
+    "duration_seconds": 0,
+    "os_platform": "windows",
+    "submitted_at": "2026-06-05T14:10:43+03:00"
+  },
+  "summary": {
+    "behavioral_summary": "No threat signatures triggered. The sample completed execution with standard system calls and appears benign.",
+    "key_behaviors": [
+      "Contains debugger detection API string"
+    ],
+    "threat_level": "CLEAN",
+    "threat_score": 5
+  },
+  "mitre_attack": [
+    {
+      "job_id": "b9769ab7-17f3-b262-ca04-09269130640a",
+      "technique_id": "T1497.001",
+      "technique_name": "AntiDebugIsDebuggerPresent",
+      "tactic": "Defense Evasion",
+      "evidence_ids": "E:\\Gasha\\Sandbox\\malicious_test_sample.exe",
+      "confidence": 85,
+      "severity": 0
+    }
+  ],
+  "iocs": {
+    "extracted_iocs": null,
+    "hashes": {
+      "sha256": "d5697fef6995e992b9232a2b19665a297743427316c7225a5b772f0032f20fca"
+    }
+  },
+  "behavioral_timeline": [
+    {
+      "id": 1,
+      "job_id": "b9769ab7-17f3-b262-ca04-09269130640a",
+      "timestamp": "2026-06-05T14:10:43.3487913+03:00",
+      "event_type": "process_create",
+      "pid": 10712,
+      "category": "process",
+      "data": {
+        "cmdline": "sample_isolated.exe",
+        "image_path": "C:\\Windows\\Temp\\sample_isolated.exe",
+        "is_injected": false,
+        "pid": 10712,
+        "ppid": 1000,
+        "user": "SandboxUser"
+      },
+      "severity": 0
+    }
+  ],
+  "rule_hits": [
+    {
+      "rule_name": "AntiDebugIsDebuggerPresent",
+      "engine": "yara",
+      "description": "Contains debugger detection API string",
+      "severity": "low",
+      "mitre_ttp": "T1497.001",
+      "matched_on": "E:\\Gasha\\Sandbox\\malicious_test_sample.exe",
+      "evidence": "Found byte sequence: IsDebuggerPresent"
+    }
+  ]
+}

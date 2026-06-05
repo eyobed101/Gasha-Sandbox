@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LEMAS Malware Analysis Report</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-base: #080b11;
+            --bg-surface: rgba(17, 25, 40, 0.75);
+            --border-glass: rgba(255, 255, 255, 0.08);
+            --accent-clean: #00f2fe;
+            --accent-suspicious: #ff9900;
+            --accent-malicious: #ff007f;
+            --text-primary: #f3f4f6;
+            --text-secondary: #9ca3af;
+            --text-muted: #6b7280;
+            --glow-color: rgba(255, 0, 127, 0.15);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        body {
+            background-color: var(--bg-base);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(0, 242, 254, 0.05) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(255, 0, 127, 0.05) 0%, transparent 40%);
+            padding: 2.5rem;
+        }
+
+        .container {
+            max-width: 1300px;
+            margin: 0 auto;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1.5rem 2rem;
+            background: var(--bg-surface);
+            backdrop-filter: blur(16px);
+            border: 1px solid var(--border-glass);
+            border-radius: 20px;
+            margin-bottom: 2rem;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+
+        .logo-section h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 2.2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -1px;
+        }
+
+        .logo-section p {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            margin-top: 0.2rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .threat-badge {
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+        }
+
+        .gauge-container {
+            position: relative;
+            width: 80px;
+            height: 80px;
+        }
+
+        .gauge-svg {
+            transform: rotate(-90deg);
+            width: 100%;
+            height: 100%;
+        }
+
+        .gauge-bg {
+            fill: none;
+            stroke: rgba(255, 255, 255, 0.05);
+            stroke-width: 8;
+        }
+
+        .gauge-fill {
+            fill: none;
+            stroke: var(--accent-color);
+            stroke-width: 8;
+            stroke-linecap: round;
+            transition: stroke-dasharray 1s ease-in-out;
+        }
+
+        .gauge-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: var(--accent-color);
+        }
+
+        .threat-status-text {
+            text-align: right;
+        }
+
+        .threat-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+        }
+
+        .threat-value {
+            font-size: 1.8rem;
+            font-weight: 800;
+            font-family: 'Outfit', sans-serif;
+            color: var(--accent-color);
+            text-shadow: 0 0 15px var(--glow-color);
+        }
+
+        .grid-main {
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .glass-card {
+            background: var(--bg-surface);
+            backdrop-filter: blur(16px);
+            border: 1px solid var(--border-glass);
+            border-radius: 20px;
+            padding: 2rem;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.25);
+            transition: transform 0.3s ease, border-color 0.3s ease;
+        }
+
+        .glass-card:hover {
+            border-color: rgba(255, 255, 255, 0.15);
+        }
+
+        .card-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            border-bottom: 1px solid var(--border-glass);
+            padding-bottom: 0.75rem;
+        }
+
+        .meta-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1.5rem;
+        }
+
+        .meta-item {
+            display: flex;
+            flex-direction: column;
+            gap: 0.3rem;
+        }
+
+        .meta-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .meta-value {
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            word-break: break-all;
+        }
+
+        .behavior-summary {
+            grid-column: span 2;
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 10px;
+            border-left: 4px solid var(--accent-color);
+            margin-top: 1rem;
+            line-height: 1.5;
+        }
+
+        /* Sidebar stats */
+        .stat-box {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .mini-stat {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-glass);
+            padding: 1.25rem;
+            border-radius: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .mini-stat-label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .mini-stat-val {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.4rem;
+            font-weight: 700;
+        }
+
+        /* Interactive Tabs */
+        .tabs-header {
+            display: flex;
+            gap: 0.75rem;
+            background: rgba(255, 255, 255, 0.02);
+            padding: 0.4rem;
+            border-radius: 12px;
+            border: 1px solid var(--border-glass);
+            margin-bottom: 1.5rem;
+        }
+
+        .tab-btn {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .tab-btn:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .tab-btn.active {
+            color: #080b11;
+            background: #f3f4f6;
+        }
+
+        .tab-content {
+            display: none;
+            animation: fadeIn 0.4s ease forwards;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Timeline styles */
+        .timeline {
+            position: relative;
+            padding-left: 2rem;
+            border-left: 2px solid var(--border-glass);
+            margin-left: 0.5rem;
+        }
+
+        .timeline-item {
+            position: relative;
+            margin-bottom: 1.5rem;
+        }
+
+        .timeline-badge {
+            position: absolute;
+            left: -2.4rem;
+            top: 0.2rem;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            border: 3px solid var(--bg-base);
+        }
+
+        .timeline-badge.sev-4 { background: var(--accent-malicious); box-shadow: 0 0 10px var(--accent-malicious); }
+        .timeline-badge.sev-3 { background: var(--accent-suspicious); box-shadow: 0 0 10px var(--accent-suspicious); }
+        .timeline-badge.sev-2 { background: #ffd700; }
+        .timeline-badge.sev-1 { background: #00f2fe; }
+
+        .timeline-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.4rem;
+        }
+
+        .timeline-title {
+            font-weight: 700;
+            font-size: 0.95rem;
+            color: var(--text-primary);
+        }
+
+        .timeline-time {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .timeline-desc {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            line-height: 1.4;
+            background: rgba(255, 255, 255, 0.01);
+            padding: 0.75rem;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.03);
+        }
+
+        /* Signature Hits & Tables */
+        .sig-hit {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-glass);
+            padding: 1rem 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.2s ease;
+        }
+
+        .sig-hit:hover {
+            background: rgba(255, 255, 255, 0.04);
+            transform: translateX(4px);
+        }
+
+        .sig-name {
+            font-weight: 700;
+            color: var(--accent-color);
+            font-family: 'Outfit', sans-serif;
+        }
+
+        .sig-engine {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            background: rgba(255, 255, 255, 0.08);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            color: var(--text-secondary);
+            margin-left: 0.5rem;
+        }
+
+        .badge-danger { background: rgba(255, 0, 127, 0.15); color: var(--accent-malicious); border: 1px solid rgba(255, 0, 127, 0.3); }
+        .badge-warning { background: rgba(255, 153, 0, 0.15); color: var(--accent-suspicious); border: 1px solid rgba(255, 153, 0, 0.3); }
+        .badge-info { background: rgba(0, 242, 254, 0.15); color: var(--accent-clean); border: 1px solid rgba(0, 242, 254, 0.3); }
+
+        .sig-meta {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 0.2rem;
+        }
+
+        .badge {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.6rem;
+            border-radius: 6px;
+            font-weight: 700;
+        }
+
+        /* MITRE Matrix */
+        .mitre-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 1rem;
+        }
+
+        .mitre-cell {
+            background: rgba(255, 255, 255, 0.01);
+            border: 1px solid var(--border-glass);
+            border-radius: 12px;
+            padding: 1rem;
+        }
+
+        .mitre-tactic {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-muted);
+            margin-bottom: 0.4rem;
+        }
+
+        .mitre-tech {
+            font-weight: 700;
+            font-size: 0.9rem;
+            color: var(--text-primary);
+        }
+
+        .mitre-id {
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.75rem;
+            color: var(--accent-color);
+            margin-top: 0.2rem;
+        }
+
+        .mitre-evidence {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 0.6rem;
+            background: rgba(255, 255, 255, 0.02);
+            padding: 0.5rem;
+            border-radius: 6px;
+        }
+
+        /* Generic table formatting */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-glass);
+            font-size: 0.85rem;
+        }
+
+        th {
+            color: var(--text-muted);
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 1px;
+        }
+
+        td {
+            color: var(--text-secondary);
+        }
+
+        tr:hover td {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.01);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Dashboard Header -->
+        <header>
+            <div class="logo-section">
+                <h1>LEMAS Sandbox</h1>
+                <p>Advanced Endpoint Behavioral Analysis</p>
+            </div>
+            
+            <div class="threat-badge" style="--accent-color: {{.AccentColor}}; --glow-color: {{.GlowColor}};">
+                <div class="threat-status-text">
+                    <div class="threat-label">Threat Classification</div>
+                    <div class="threat-value">{{.ThreatLevel}}</div>
+                </div>
+                <div class="gauge-container">
+                    <svg class="gauge-svg">
+                        <circle class="gauge-bg" cx="40" cy="40" r="32"></circle>
+                        <circle class="gauge-fill" cx="40" cy="40" r="32" 
+                                style="stroke-dasharray: {{.DashArray}} 201;"></circle>
+                    </svg>
+                    <div class="gauge-text">{{.ThreatScore}}</div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Workspace Metadata -->
+        <div class="grid-main">
+            <div class="glass-card" style="--accent-color: {{.AccentColor}};">
+                <div class="card-title">Analysis Session Details</div>
+                <div class="meta-grid">
+                    <div class="meta-item">
+                        <div class="meta-label">Target File</div>
+                        <div class="meta-value" style="font-weight: 700;">{{.FilePath}}</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="meta-label">File Type</div>
+                        <div class="meta-value">{{.FileType}}</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="meta-label">SHA256 Hash</div>
+                        <div class="meta-value" style="font-family: monospace;">{{.SHA256}}</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="meta-label">Analysis Duration</div>
+                        <div class="meta-value">{{.Duration}} seconds</div>
+                    </div>
+                    <div class="behavior-summary">
+                        <strong>Behavioral Classifier Summary:</strong> {{.SummaryText}}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Side Quick Stats -->
+            <div class="glass-card stat-box">
+                <div class="mini-stat">
+                    <div class="mini-stat-label">Total Events</div>
+                    <div class="mini-stat-val" style="color: #4facfe;">{{.TotalEvents}}</div>
+                </div>
+                <div class="mini-stat">
+                    <div class="mini-stat-label">YARA Hits</div>
+                    <div class="mini-stat-val" style="color: var(--accent-malicious);">{{.YaraHits}}</div>
+                </div>
+                <div class="mini-stat">
+                    <div class="mini-stat-label">Sigma Matches</div>
+                    <div class="mini-stat-val" style="color: var(--accent-suspicious);">{{.SigmaHits}}</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Details Dashboard Tabs -->
+        <div class="glass-card">
+            <div class="tabs-header">
+                <button class="tab-btn active" onclick="switchTab(event, 'tab-timeline')">Execution Timeline</button>
+                <button class="tab-btn" onclick="switchTab(event, 'tab-mitre')">MITRE ATT&CK Mapping</button>
+                <button class="tab-btn" onclick="switchTab(event, 'tab-iocs')">Extracted IOCs</button>
+                <button class="tab-btn" onclick="switchTab(event, 'tab-signatures')">Signature Matches</button>
+            </div>
+
+            <!-- Tab 1: Timeline -->
+            <div id="tab-timeline" class="tab-content active">
+                <div class="timeline">
+                    {{range .Events}}
+                    <div class="timeline-item">
+                        <div class="timeline-badge sev-{{.Severity}}"></div>
+                        <div class="timeline-header">
+                            <span class="timeline-title">{{.EventType}}</span>
+                            <span class="timeline-time">PID: {{.PID}} | TID: {{.TID}} | {{.Timestamp}}</span>
+                        </div>
+                        <div class="timeline-desc">
+                            <strong>Category:</strong> {{.Category}} | 
+                            {{range $k, $v := .Data}}
+                            <strong>{{$k}}:</strong> {{$v}} &nbsp;
+                            {{end}}
+                        </div>
+                    </div>
+                    {{else}}
+                    <p style="color: var(--text-muted);">No telemetry events recorded during execution.</p>
+                    {{end}}
+                </div>
+            </div>
+
+            <!-- Tab 2: MITRE ATT&CK Mapping -->
+            <div id="tab-mitre" class="tab-content">
+                <div class="mitre-grid">
+                    {{range .TTPs}}
+                    <div class="mitre-cell" style="--accent-color: {{$.AccentColor}};">
+                        <div class="mitre-tactic">{{.Tactic}}</div>
+                        <div class="mitre-tech">{{.TechniqueName}}</div>
+                        <div class="mitre-id">{{.TechniqueID}}</div>
+                        <div class="mitre-evidence">{{.EvidenceIDs}}</div>
+                    </div>
+                    {{else}}
+                    <p style="color: var(--text-muted);">No MITRE ATT&CK techniques identified.</p>
+                    {{end}}
+                </div>
+            </div>
+
+            <!-- Tab 3: Extracted IOCs -->
+            <div id="tab-iocs" class="tab-content">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>IOC Type</th>
+                            <th>Value</th>
+                            <th>Context</th>
+                            <th>Confidence</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {{range .IOCs}}
+                        <tr>
+                            <td><span class="badge badge-info">{{.IOCType}}</span></td>
+                            <td style="font-family: monospace; font-weight: 600;">{{.Value}}</td>
+                            <td>{{.Context}}</td>
+                            <td>{{.Confidence}}%</td>
+                        </tr>
+                        {{else}}
+                        <tr>
+                            <td colspan="4" style="color: var(--text-muted); text-align: center;">No Indicators of Compromise (IOCs) identified.</td>
+                        </tr>
+                        {{end}}
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Tab 4: Signatures -->
+            <div id="tab-signatures" class="tab-content">
+                {{range .Hits}}
+                <div class="sig-hit">
+                    <div>
+                        <span class="sig-name" style="--accent-color: {{if eq .Severity "critical"}}var(--accent-malicious){{else if eq .Severity "high"}}var(--accent-malicious){{else if eq .Severity "medium"}}var(--accent-suspicious){{else}}var(--accent-clean){{end}};">{{.RuleName}}</span>
+                        <span class="sig-engine">{{.Engine}}</span>
+                        <p style="margin-top: 0.4rem; font-size: 0.9rem; color: var(--text-secondary);">{{.Description}}</p>
+                        <div class="sig-meta">
+                            <strong>Matched On:</strong> {{.MatchedOn}} | <strong>Evidence:</strong> {{.Evidence}}
+                        </div>
+                    </div>
+                    <div>
+                        <span class="badge {{if eq .Severity "critical"}}badge-danger{{else if eq .Severity "high"}}badge-danger{{else if eq .Severity "medium"}}badge-warning{{else}}badge-info{{end}}">{{.Severity}}</span>
+                    </div>
+                </div>
+                {{else}}
+                <p style="color: var(--text-muted);">No rule signatures triggered.</p>
+                {{end}}
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(evt, tabId) {
+            const contents = document.getElementsByClassName("tab-content");
+            for (let i = 0; i < contents.length; i++) {
+                contents[i].classList.remove("active");
+            }
+            const buttons = document.getElementsByClassName("tab-btn");
+            for (let i = 0; i < buttons.length; i++) {
+                buttons[i].classList.remove("active");
+            }
+            document.getElementById(tabId).classList.add("active");
+            evt.currentTarget.classList.add("active");
+        }
+    </script>
+</body>
+</html>
