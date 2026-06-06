@@ -4,8 +4,11 @@ package monitor
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha256"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,14 +23,22 @@ type WindowsMonitor struct {
 	cancel        context.CancelFunc
 	mu            sync.RWMutex
 	monitoredPIDs map[int]bool
+	// processCache caches (image_path, cmdline) by PID for parent enrichment
+	processCache  map[int]processInfo
 	session       *etw.RealTimeSession
 	consumer      *etw.Consumer
 	correlator    *CorrelationEngine
 }
 
+type processInfo struct {
+	image   string
+	cmdline string
+}
+
 func NewMonitor() *WindowsMonitor {
 	return &WindowsMonitor{
 		monitoredPIDs: make(map[int]bool),
+		processCache:  make(map[int]processInfo),
 	}
 }
 
@@ -216,19 +227,58 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 				image, _ = getPropertyString(e, "ImageFileName")
 			}
 			cmdline, _ := getPropertyString(e, "CommandLine")
-			user, _ := getPropertyString(e, "UserSid") // System Sid or User String representation
+			user, _ := getPropertyString(e, "UserSid")
+
+			// Resolve parent image/cmdline from cache
+			m.mu.RLock()
+			parentInfo := m.processCache[ppid]
+			m.mu.RUnlock()
+
+			// Cache this process for future children
+			m.mu.Lock()
+			m.processCache[eventPID] = processInfo{image: image, cmdline: cmdline}
+			m.mu.Unlock()
+
+			// Resolve integrity level from token if available
+			integrityLevel, _ := getPropertyString(e, "MandatoryLabel")
+			if integrityLevel == "" {
+				integrityLevel, _ = getPropertyString(e, "IntegrityLevel")
+			}
+			integrityLevel = normaliseIntegrityLevel(integrityLevel)
+
+			// Hash the image file for IOC matching
+			hashes := hashImageFile(image)
 
 			normalized.Data["pid"] = eventPID
 			normalized.Data["ppid"] = ppid
 			normalized.Data["image_path"] = image
 			normalized.Data["cmdline"] = cmdline
-			normalized.Data["user"] = user
+			normalized.Data["user"] = resolveSIDToUser(user)
+			normalized.Data["integrity_level"] = integrityLevel
+			normalized.Data["parent_image"] = parentInfo.image
+			normalized.Data["parent_cmdline"] = parentInfo.cmdline
 			normalized.Data["is_injected"] = false
+			// Sigma fields (exact names used in community rules)
+			normalized.Data["Image"] = image
+			normalized.Data["CommandLine"] = cmdline
+			normalized.Data["ParentImage"] = parentInfo.image
+			normalized.Data["ParentCommandLine"] = parentInfo.cmdline
+			normalized.Data["User"] = resolveSIDToUser(user)
+			normalized.Data["IntegrityLevel"] = integrityLevel
+			if hashes != nil {
+				normalized.Data["Hashes"] = hashes
+				normalized.Data["sha256"] = hashes["sha256"]
+				normalized.Data["md5"] = hashes["md5"]
+			}
 		} else if e.System.EventID == 2 {
 			normalized.EventType = EventProcessExit
 			exitCode, _ := getPropertyInt(e, "ExitStatus")
 			normalized.Data["pid"] = eventPID
 			normalized.Data["exit_code"] = exitCode
+			// Clean up cache on exit
+			m.mu.Lock()
+			delete(m.processCache, eventPID)
+			m.mu.Unlock()
 		} else {
 			return
 		}
@@ -246,14 +296,17 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 			normalized.EventType = EventFileWrite
 			normalized.Data["operation"] = "WRITE"
 			normalized.Data["path"] = fileName
+			normalized.Data["TargetFilename"] = fileName
 		} else if strings.Contains(opcodeName, "delete") || strings.Contains(opcodeName, "cleanup") || e.System.EventID == 15 {
 			normalized.EventType = EventFileDelete
 			normalized.Data["operation"] = "DELETE"
 			normalized.Data["path"] = fileName
+			normalized.Data["TargetFilename"] = fileName
 		} else if strings.Contains(opcodeName, "rename") || e.System.EventID == 16 {
 			normalized.EventType = EventFileWrite
 			normalized.Data["operation"] = "RENAME"
 			normalized.Data["path"] = fileName
+			normalized.Data["TargetFilename"] = fileName
 			if newName, ok := getPropertyString(e, "NewFileName"); ok {
 				normalized.Data["new_path"] = newName
 			}
@@ -279,15 +332,20 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 			normalized.Data["key"] = keyName
 			valName, _ := getPropertyString(e, "ValueName")
 			normalized.Data["value_name"] = valName
+			normalized.Data["TargetObject"] = keyName + "\\" + valName
 			if valData, ok := e.EventData["ValueData"]; ok {
 				normalized.Data["value_data"] = fmt.Sprintf("%v", valData)
+				normalized.Data["Details"] = fmt.Sprintf("%v", valData)
 			}
+			normalized.Data["EventType"] = "SetValue"
 		} else if strings.Contains(opcodeName, "deletevalue") || e.System.EventID == 7 {
 			normalized.EventType = EventRegDelete
 			normalized.Data["operation"] = "DELETE"
 			normalized.Data["key"] = keyName
 			valName, _ := getPropertyString(e, "ValueName")
 			normalized.Data["value_name"] = valName
+			normalized.Data["TargetObject"] = keyName + "\\" + valName
+			normalized.Data["EventType"] = "DeleteValue"
 		} else {
 			return // ignore opens/reads
 		}
@@ -312,8 +370,25 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		normalized.Data["protocol"] = "TCP"
 		normalized.Data["dest_ip"] = destIP
 		normalized.Data["dest_port"] = destPort
+		normalized.Data["DestinationIp"] = destIP
+		normalized.Data["DestinationPort"] = destPort
+		normalized.Data["Initiated"] = true
+		// Source address fields
+		srcIP, _ := getPropertyString(e, "saddr")
+		if srcIP == "" {
+			srcIP, _ = getPropertyString(e, "SourceAddress")
+		}
+		srcPort, _ := getPropertyInt(e, "sport")
+		if srcPort == 0 {
+			srcPort, _ = getPropertyInt(e, "SourcePort")
+		}
+		if srcIP != "" {
+			normalized.Data["SourceIp"] = srcIP
+			normalized.Data["SourcePort"] = srcPort
+		}
 		if domain, ok := getPropertyString(e, "Domain"); ok {
 			normalized.Data["domain"] = domain
+			normalized.Data["DestinationHostname"] = domain
 		}
 
 	// ── Task A: Thread provider ───────────────────────────────────────────────
@@ -417,6 +492,11 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		} else {
 			return // benign system DLL load — skip
 		}
+		// Sigma image_load field names
+		normalized.Data["ImageLoaded"] = imageName
+		normalized.Data["Signed"] = isSigned(imageName)
+		normalized.Data["Signature"] = getSignatureInfo(imageName)
+		normalized.Data["SignatureStatus"] = getSignatureStatus(imageName)
 
 	// ── Task B: DNS-Client provider ───────────────────────────────────────────
 	case "Microsoft-Windows-DNS-Client":
@@ -442,6 +522,10 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		normalized.Data["query_status"] = queryStatus
 		normalized.Data["query_results"] = queryResults
 		normalized.Data["protocol"] = "DNS"
+		// Sigma dns_query field names
+		normalized.Data["QueryName"] = queryName
+		normalized.Data["QueryType"] = queryType
+		normalized.Data["QueryResults"] = queryResults
 		// DNS events fire in the context of the process issuing the query;
 		// header ProcessID is the actual querying process.
 		normalized.PID = int(e.System.Execution.ProcessID)
@@ -531,6 +615,9 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		normalized.Data["script_path"] = path
 		normalized.Data["script_block_id"] = scriptBlockID
 		normalized.Data["mitre_ttp"] = "T1059.001"
+		// Sigma ps_script canonical field names
+		normalized.Data["ScriptBlockText"] = scriptBlock
+		normalized.Data["Path"] = path
 
 	default:
 		return
@@ -619,3 +706,107 @@ func isAdmin() bool {
 	}
 	return member
 }
+
+// normaliseIntegrityLevel converts raw SID or label strings to Sigma-expected
+// human-readable form: "Low", "Medium", "High", "System".
+func normaliseIntegrityLevel(raw string) string {
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(lower, "s-1-16-4096") || lower == "low":
+		return "Low"
+	case strings.Contains(lower, "s-1-16-8192") || lower == "medium":
+		return "Medium"
+	case strings.Contains(lower, "s-1-16-12288") || lower == "high":
+		return "High"
+	case strings.Contains(lower, "s-1-16-16384") || lower == "system":
+		return "System"
+	}
+	return raw
+}
+
+// resolveSIDToUser maps a SID string to DOMAIN\user form for Sigma User field matching.
+func resolveSIDToUser(sidStr string) string {
+	if sidStr == "" {
+		return ""
+	}
+	wellKnown := map[string]string{
+		"S-1-5-18":     `NT AUTHORITY\SYSTEM`,
+		"S-1-5-19":     `NT AUTHORITY\LOCAL SERVICE`,
+		"S-1-5-20":     `NT AUTHORITY\NETWORK SERVICE`,
+		"S-1-5-32-544": `BUILTIN\Administrators`,
+	}
+	if name, ok := wellKnown[sidStr]; ok {
+		return name
+	}
+	sid, err := windows.StringToSid(sidStr)
+	if err != nil {
+		return sidStr
+	}
+	account, domain, _, err := sid.LookupAccount("")
+	if err != nil {
+		return sidStr
+	}
+	return domain + `\` + account
+}
+
+// hashImageFile computes SHA256+MD5 of the spawned image for hash-based Sigma rules.
+// Skips known system paths and returns nil on read errors.
+func hashImageFile(imagePath string) map[string]string {
+	if imagePath == "" {
+		return nil
+	}
+	lower := strings.ToLower(imagePath)
+	// Skip large trusted system binaries for performance
+	if strings.HasPrefix(lower, `c:\windows\system32\`) ||
+		strings.HasPrefix(lower, `c:\windows\syswow64\`) {
+		return nil
+	}
+	data, err := os.ReadFile(imagePath)
+	if err != nil {
+		return nil
+	}
+	sha := fmt.Sprintf("%x", sha256.Sum256(data))
+	md := fmt.Sprintf("%x", md5.Sum(data))
+	return map[string]string{
+		"sha256": sha, "SHA256": sha,
+		"md5": md, "MD5": md,
+	}
+}
+
+// isSigned returns "true"/"false" string for Sigma's Signed field.
+// Uses path heuristics as a fast approximation; full Authenticode requires
+// WinVerifyTrust which needs cgo or an external library.
+func isSigned(imagePath string) string {
+	lower := strings.ToLower(imagePath)
+	trusted := []string{
+		`c:\windows\system32\`, `c:\windows\syswow64\`,
+		`c:\windows\winsxs\`, `c:\program files\`, `c:\program files (x86)\`,
+	}
+	for _, p := range trusted {
+		if strings.HasPrefix(lower, p) {
+			return "true"
+		}
+	}
+	return "false"
+}
+
+func getSignatureInfo(imagePath string) string {
+	lower := strings.ToLower(imagePath)
+	if strings.Contains(lower, `c:\windows\`) {
+		return "Microsoft Windows"
+	}
+	if strings.Contains(lower, `c:\program files\microsoft`) {
+		return "Microsoft Corporation"
+	}
+	return ""
+}
+
+func getSignatureStatus(imagePath string) string {
+	if isSigned(imagePath) == "true" {
+		return "Valid"
+	}
+	return "Unsigned"
+}
+
+func sha256sum(data []byte) [32]byte { return sha256.Sum256(data) }
+func md5sum(data []byte) [16]byte    { return md5.Sum(data) }
