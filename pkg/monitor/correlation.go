@@ -2,45 +2,65 @@ package monitor
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
-// CorrelationEngine maintains an in-memory behavior graph to correlate events.
+// processKey uniquely identifies a process instance resistant to PID reuse.
+// Using PID alone is unsafe because OSes recycle PIDs.
+type processKey struct {
+	PID       int
+	SpawnTime int64 // Unix nanoseconds
+}
+
+// CorrelationEngine maintains an in-memory behavior graph.
 type CorrelationEngine struct {
-	mu           sync.RWMutex
-	jobID        string
-	processes    map[int]*ProcessNode
-	fileWrites   map[int][]string          // PID -> files written
-	regWrites    map[int][]string          // PID -> registry keys written
-	netConns     map[int][]string          // PID -> dest IP/domain
-	apiCalls     map[int][]string          // PID -> API calls made
-	injectionMap map[int]map[int]bool      // Source PID -> Target PID -> Injecting actions
-	// Task A additions
-	dllLoads     map[int][]string          // PID -> DLL image paths loaded (Task A)
-	// Task B additions
-	dnsQueries   map[int][]string          // PID -> DNS query names (Task B)
-	handleAccess map[int][]string          // PID -> object names accessed (Task B)
-	// Task C additions
-	scriptBlocks map[int][]string          // PID -> PS script block snippets (Task C)
-	alerts       chan<- Event
+	mu sync.RWMutex
+
+	jobID string
+
+	// Process graph — keyed by processKey (PID+SpawnTime) to resist PID reuse.
+	processes map[processKey]*ProcessNode
+	// pidToKey maps bare PID → most-recent processKey (for lookup by PID only).
+	pidToKey map[int]processKey
+
+	// Behavioral state maps — keyed by PID (fast path; PID reuse within a single
+	// sandbox session is extremely unlikely given short analysis windows).
+	fileWrites   map[int][]string
+	regWrites    map[int][]string
+	netConns     map[int][]string
+	apiCalls     map[int][]string
+	injectionMap map[int]map[int]bool
+
+	// Extended telemetry maps (Tasks A/B/C)
+	dllLoads     map[int][]string
+	dnsQueries   map[int][]string
+	handleAccess map[int][]string
+	scriptBlocks map[int][]string
+
+	alerts chan<- Event
 }
 
 type ProcessNode struct {
-	PID         int
-	PPID        int
-	ImagePath   string
-	CommandLine string
-	SpawnTime   time.Time
-	User        string
-	Integrity   string
+	PID           int
+	PPID          int
+	ImagePath     string
+	CommandLine   string
+	OriginalName  string // PE/ELF OriginalFileName (lolbin rename detection)
+	SpawnTime     time.Time
+	User          string
+	Integrity     string
+	ProcessGUID   string
+	LogonID       string
 }
 
 func NewCorrelationEngine(jobID string, alerts chan<- Event) *CorrelationEngine {
 	return &CorrelationEngine{
 		jobID:        jobID,
-		processes:    make(map[int]*ProcessNode),
+		processes:    make(map[processKey]*ProcessNode),
+		pidToKey:     make(map[int]processKey),
 		fileWrites:   make(map[int][]string),
 		regWrites:    make(map[int][]string),
 		netConns:     make(map[int][]string),
@@ -54,52 +74,37 @@ func NewCorrelationEngine(jobID string, alerts chan<- Event) *CorrelationEngine 
 	}
 }
 
-// ProcessEvent updates the behavior graph and performs correlation checks.
+// ProcessEvent updates the behavior graph and fires correlation checks.
 func (ce *CorrelationEngine) ProcessEvent(ev Event) {
 	ce.mu.Lock()
 	defer ce.mu.Unlock()
 
-	// 1. Update Graph Nodes
 	switch ev.EventType {
+
 	case EventProcessCreate:
-		pid := ev.PID
-		ppid := 0
-		image := ""
-		cmdline := ""
-		user := ""
-		integrity := ""
+		node := ce.buildProcessNode(ev)
+		key := processKey{PID: ev.PID, SpawnTime: ev.Timestamp.UnixNano()}
+		ce.processes[key] = node
+		ce.pidToKey[ev.PID] = key
 
-		if val, ok := ev.Data["ppid"].(int); ok {
-			ppid = val
-		} else if valf, ok := ev.Data["ppid"].(float64); ok {
-			ppid = int(valf)
-		}
-		if val, ok := ev.Data["image_path"].(string); ok {
-			image = val
-		}
-		if val, ok := ev.Data["cmdline"].(string); ok {
-			cmdline = val
-		}
-		if val, ok := ev.Data["user"].(string); ok {
-			user = val
-		}
-		if val, ok := ev.Data["integrity_level"].(string); ok {
-			integrity = val
-		}
-
-		node := &ProcessNode{
-			PID:         pid,
-			PPID:        ppid,
-			ImagePath:   image,
-			CommandLine: cmdline,
-			SpawnTime:   ev.Timestamp,
-			User:        user,
-			Integrity:   integrity,
-		}
-		ce.processes[pid] = node
-
-		// Run Privilege Escalation Check
 		ce.checkPrivilegeEscalation(node, ev.Timestamp)
+		ce.checkLolbinRename(node, ev.Timestamp)
+
+	case EventProcessExit:
+		if key, ok := ce.pidToKey[ev.PID]; ok {
+			delete(ce.processes, key)
+			delete(ce.pidToKey, ev.PID)
+		}
+		// Clean behavioural state — process is gone
+		delete(ce.fileWrites, ev.PID)
+		delete(ce.regWrites, ev.PID)
+		delete(ce.netConns, ev.PID)
+		delete(ce.apiCalls, ev.PID)
+		delete(ce.injectionMap, ev.PID)
+		delete(ce.dllLoads, ev.PID)
+		delete(ce.dnsQueries, ev.PID)
+		delete(ce.handleAccess, ev.PID)
+		delete(ce.scriptBlocks, ev.PID)
 
 	case EventFileWrite:
 		if path, ok := ev.Data["path"].(string); ok {
@@ -119,18 +124,7 @@ func (ce *CorrelationEngine) ProcessEvent(ev Event) {
 		}
 
 	case EventNetConnect:
-		dest := ""
-		if ip, ok := ev.Data["dest_ip"].(string); ok {
-			dest = ip
-			if port, ok := ev.Data["dest_port"].(int); ok {
-				dest = fmt.Sprintf("%s:%d", dest, port)
-			} else if portf, ok := ev.Data["dest_port"].(float64); ok {
-				dest = fmt.Sprintf("%s:%d", dest, int(portf))
-			}
-		}
-		if domain, ok := ev.Data["domain"].(string); ok && domain != "" {
-			dest = fmt.Sprintf("%s (%s)", dest, domain)
-		}
+		dest := buildDestString(ev)
 		if dest != "" {
 			ce.netConns[ev.PID] = append(ce.netConns[ev.PID], dest)
 			ce.checkC2Aftermath(ev.PID, dest, ev.Timestamp)
@@ -143,32 +137,21 @@ func (ce *CorrelationEngine) ProcessEvent(ev Event) {
 			ce.checkProcessInjection(ev.PID, apiName, ev.Data, ev.Timestamp)
 		}
 
-	// ── Task A: DLL/Image load tracking ──────────────────────────────────────
 	case EventImageLoad:
 		imageName, _ := ev.Data["image_name"].(string)
 		if imageName != "" {
 			ce.dllLoads[ev.PID] = append(ce.dllLoads[ev.PID], imageName)
 		}
-		isReflective, _ := ev.Data["reflective"].(bool)
-		if isReflective {
+		if reflective, _ := ev.Data["reflective"].(bool); reflective {
 			ce.checkReflectiveInjection(ev.PID, imageName, ev.Timestamp)
 		}
 
-	// ── Task A: Thread creation (cross-process) ───────────────────────────────
 	case EventThreadCreate:
-		// The APICall echo is already emitted in monitor_windows.go; however we
-		// also record it here for completeness and future chained correlation.
-		targetPID, _ := ev.Data["target_pid"].(int)
-		if targetPID == 0 {
-			if tf, ok := ev.Data["target_pid"].(float64); ok {
-				targetPID = int(tf)
-			}
-		}
+		targetPID := extractTargetPID(ev.Data)
 		if targetPID != 0 && targetPID != ev.PID {
 			ce.checkProcessInjection(ev.PID, "CreateRemoteThread", ev.Data, ev.Timestamp)
 		}
 
-	// ── Task B: DNS query tracking ────────────────────────────────────────────
 	case EventNetDNS:
 		query, _ := ev.Data["dns_query"].(string)
 		if query == "" {
@@ -176,12 +159,10 @@ func (ce *CorrelationEngine) ProcessEvent(ev Event) {
 		}
 		if query != "" {
 			ce.dnsQueries[ev.PID] = append(ce.dnsQueries[ev.PID], query)
-			// Store domain in netConns so existing checkC2Aftermath() fires
 			ce.netConns[ev.PID] = append(ce.netConns[ev.PID], query)
 			ce.checkC2Aftermath(ev.PID, query, ev.Timestamp)
 		}
 
-	// ── Task B: Handle access tracking ───────────────────────────────────────
 	case EventHandleCreate, EventHandleDuplicate:
 		objectName, _ := ev.Data["object_name"].(string)
 		objectType, _ := ev.Data["object_type"].(string)
@@ -190,11 +171,9 @@ func (ce *CorrelationEngine) ProcessEvent(ev Event) {
 		}
 		ce.checkLSASSAccess(ev.PID, objectType, objectName, ev.Timestamp)
 
-	// ── Task C: PowerShell / AMSI script block tracking ───────────────────────
 	case EventPowerShell, EventAMSIScan:
 		script, _ := ev.Data["script_block"].(string)
 		if script != "" {
-			// Store a short prefix only (avoid memory bloat from huge blocks)
 			prefix := script
 			if len(prefix) > 256 {
 				prefix = prefix[:256]
@@ -204,179 +183,238 @@ func (ce *CorrelationEngine) ProcessEvent(ev Event) {
 	}
 }
 
-// checkPrivilegeEscalation compares parent process context with the child.
-func (ce *CorrelationEngine) checkPrivilegeEscalation(child *ProcessNode, t time.Time) {
-	parent, exists := ce.processes[child.PPID]
-	if !exists {
-		return
-	}
+// ─── Node builder ─────────────────────────────────────────────────────────────
 
-	// Windows: low/medium integrity spawning high/system integrity
-	if parent.Integrity != "" && child.Integrity != "" {
-		isParentLow := strings.Contains(strings.ToLower(parent.Integrity), "medium") || strings.Contains(strings.ToLower(parent.Integrity), "low")
-		isChildHigh := strings.Contains(strings.ToLower(child.Integrity), "high") || strings.Contains(strings.ToLower(child.Integrity), "system")
-		if isParentLow && isChildHigh {
-			// Exclude common OS installers/elevations unless they are suspicious
-			if !strings.Contains(strings.ToLower(child.ImagePath), "consent.exe") {
-				ce.emitAlert(child.PID, "T1068", "Privilege Escalation Detected",
-					fmt.Sprintf("Process %s (%d) with integrity '%s' spawned child %s (%d) with elevated integrity '%s'",
-						parent.ImagePath, parent.PID, parent.Integrity, child.ImagePath, child.PID, child.Integrity),
-					SevHigh, t)
-			}
-		}
+func (ce *CorrelationEngine) buildProcessNode(ev Event) *ProcessNode {
+	node := &ProcessNode{
+		PID:       ev.PID,
+		SpawnTime: ev.Timestamp,
 	}
-
-	// Linux: parent runs as non-root (UID != 0), but child runs as root (UID == 0)
-	if parent.User != "" && child.User != "" {
-		if parent.User != "root" && parent.User != "0" && (child.User == "root" || child.User == "0") {
-			// Exclude sudo/su which are normal authorization agents
-			baseImage := strings.ToLower(child.ImagePath)
-			if !strings.HasSuffix(baseImage, "/sudo") && !strings.HasSuffix(baseImage, "/su") {
-				ce.emitAlert(child.PID, "T1068", "Privilege Escalation Detected",
-					fmt.Sprintf("Process %s (%d) running as user '%s' spawned child %s (%d) running as elevated user '%s'",
-						parent.ImagePath, parent.PID, parent.User, child.ImagePath, child.PID, child.User),
-					SevHigh, t)
-			}
-		}
+	if v, ok := ev.Data["ppid"].(int); ok {
+		node.PPID = v
+	} else if v, ok := ev.Data["ppid"].(float64); ok {
+		node.PPID = int(v)
 	}
+	if v, ok := ev.Data["image_path"].(string); ok {
+		node.ImagePath = v
+	}
+	if v, ok := ev.Data["cmdline"].(string); ok {
+		node.CommandLine = v
+	}
+	if v, ok := ev.Data["user"].(string); ok {
+		node.User = v
+	}
+	if v, ok := ev.Data["integrity_level"].(string); ok {
+		node.Integrity = v
+	}
+	if v, ok := ev.Data["process_guid"].(string); ok {
+		node.ProcessGUID = v
+	}
+	if v, ok := ev.Data["logon_id"].(string); ok {
+		node.LogonID = v
+	}
+	// OriginalFileName — from both lowercase and Sigma-case keys
+	if v, ok := ev.Data["original_filename"].(string); ok {
+		node.OriginalName = v
+	} else if v, ok := ev.Data["OriginalFileName"].(string); ok {
+		node.OriginalName = v
+	}
+	return node
 }
 
-// checkProcessInjection monitors cross-process operations (VirtualAllocEx, WriteProcessMemory, CreateRemoteThread, ptrace)
-func (ce *CorrelationEngine) checkProcessInjection(sourcePID int, apiName string, args map[string]interface{}, t time.Time) {
-	var targetPID int
-	var ok bool
+// ─── Correlation checks ───────────────────────────────────────────────────────
 
-	// Retrieve target PID from arguments
-	if targetVal, exists := args["target_pid"]; exists {
-		if tVal, okInt := targetVal.(int); okInt {
-			targetPID = tVal
-			ok = true
-		} else if tValf, okFloat := targetVal.(float64); okFloat {
-			targetPID = int(tValf)
-			ok = true
-		}
+// checkPrivilegeEscalation detects integrity level or UID privilege escalation.
+func (ce *CorrelationEngine) checkPrivilegeEscalation(child *ProcessNode, t time.Time) {
+	parentKey, ok := ce.pidToKey[child.PPID]
+	if !ok {
+		return
 	}
-
-	if !ok || targetPID == 0 || targetPID == sourcePID {
+	parent, ok := ce.processes[parentKey]
+	if !ok {
 		return
 	}
 
-	// Track injection progression
-	if ce.injectionMap[sourcePID] == nil {
-		ce.injectionMap[sourcePID] = make(map[int]bool)
+	// Windows integrity level
+	if parent.Integrity != "" && child.Integrity != "" {
+		pLow  := strings.Contains(strings.ToLower(parent.Integrity), "medium") ||
+			strings.Contains(strings.ToLower(parent.Integrity), "low")
+		cHigh := strings.Contains(strings.ToLower(child.Integrity), "high") ||
+			strings.Contains(strings.ToLower(child.Integrity), "system")
+		if pLow && cHigh &&
+			!strings.Contains(strings.ToLower(child.ImagePath), "consent.exe") {
+			ce.emitAlert(child.PID, "T1068", "Privilege Escalation Detected",
+				fmt.Sprintf("%s(%d)[%s] spawned %s(%d)[%s]",
+					parent.ImagePath, parent.PID, parent.Integrity,
+					child.ImagePath, child.PID, child.Integrity),
+				SevHigh, t)
+		}
 	}
 
-	lowerAPI := strings.ToLower(apiName)
-	if strings.Contains(lowerAPI, "writeprocessmemory") || strings.Contains(lowerAPI, "virtualallocex") || strings.Contains(lowerAPI, "ptrace_poketext") {
-		ce.injectionMap[sourcePID][targetPID] = true
-	}
-
-	if strings.Contains(lowerAPI, "createremotethread") || strings.Contains(lowerAPI, "ptrace_attach") {
-		// If we saw a prior write/allocation to this target PID, raise severity
-		if ce.injectionMap[sourcePID][targetPID] {
-			ce.emitAlert(sourcePID, "T1055.001", "Process Injection Attack Sequence",
-				fmt.Sprintf("Process (%d) performed VirtualAllocEx/WriteProcessMemory followed by a thread execution api (%s) on target process (%d)",
-					sourcePID, apiName, targetPID),
-				SevCritical, t)
-		} else {
-			ce.emitAlert(sourcePID, "T1055", "Suspicious Process Access API",
-				fmt.Sprintf("Process (%d) called API (%s) targeting remote process (%d)", sourcePID, apiName, targetPID),
+	// Linux UID escalation
+	if parent.User != "" && child.User != "" {
+		pNonRoot := parent.User != "root" && parent.User != "0"
+		cRoot    := child.User == "root" || child.User == "0"
+		img := strings.ToLower(child.ImagePath)
+		if pNonRoot && cRoot &&
+			!strings.HasSuffix(img, "/sudo") && !strings.HasSuffix(img, "/su") {
+			ce.emitAlert(child.PID, "T1068", "Privilege Escalation Detected",
+				fmt.Sprintf("%s(%d)[uid=%s] spawned %s(%d)[uid=%s]",
+					parent.ImagePath, parent.PID, parent.User,
+					child.ImagePath, child.PID, child.User),
 				SevHigh, t)
 		}
 	}
 }
 
-// checkPersistenceToC2 checks if writing to a persistent key/file is followed by C2 network connections.
-func (ce *CorrelationEngine) checkPersistenceToC2(pid int, objectPath string, objType string, t time.Time) {
-	// Look for persistence triggers
-	isPersistence := false
-	lowerObj := strings.ToLower(objectPath)
+// checkLolbinRename detects renamed LOLBins: Image filename ≠ OriginalFileName.
+// e.g. cmd.exe renamed to svchost.exe would show Image=svchost.exe, OriginalFileName=cmd.exe.
+// Mapped to T1036.003 (Masquerading: Rename System Utilities).
+func (ce *CorrelationEngine) checkLolbinRename(node *ProcessNode, t time.Time) {
+	if node.OriginalName == "" || node.ImagePath == "" {
+		return
+	}
+	imageName    := strings.ToLower(filepath.Base(node.ImagePath))
+	originalName := strings.ToLower(filepath.Base(node.OriginalName))
 
-	if objType == "registry" {
-		// Windows Run keys, Services, Task Scheduler
-		if strings.Contains(lowerObj, `\run`) || strings.Contains(lowerObj, `\runonce`) ||
-			strings.Contains(lowerObj, `\currentversion\services`) || strings.Contains(lowerObj, `\taskcache\`) {
-			isPersistence = true
-		}
-	} else if objType == "file" {
-		// Startup folders, cron files, systemd paths
-		if strings.Contains(lowerObj, `\startup\`) || strings.Contains(lowerObj, "/etc/cron") ||
-			strings.Contains(lowerObj, "/etc/systemd/system") || strings.Contains(lowerObj, "/etc/rc.local") {
-			isPersistence = true
-		}
+	// Strip extension for comparison
+	imageBase    := strings.TrimSuffix(imageName, filepath.Ext(imageName))
+	originalBase := strings.TrimSuffix(originalName, filepath.Ext(originalName))
+
+	if imageBase == originalBase {
+		return // names match — normal
 	}
 
+	// Known LOLBins worth flagging when renamed
+	lolbins := map[string]bool{
+		"cmd": true, "powershell": true, "powershell_ise": true,
+		"wscript": true, "cscript": true, "mshta": true,
+		"regsvr32": true, "rundll32": true, "msiexec": true,
+		"certutil": true, "bitsadmin": true, "wmic": true,
+		"net": true, "nltest": true, "sc": true,
+		"schtasks": true, "at": true, "reg": true,
+		"whoami": true, "ipconfig": true, "netstat": true,
+	}
+
+	if lolbins[originalBase] {
+		ce.emitAlert(node.PID, "T1036.003", "LOLBin Rename Detected",
+			fmt.Sprintf("Process image '%s' has OriginalFileName '%s' — possible renamed system utility",
+				node.ImagePath, node.OriginalName),
+			SevHigh, t)
+	}
+}
+
+// checkProcessInjection tracks VirtualAllocEx+WriteProcessMemory+CreateRemoteThread
+// and ptrace ATTACH+POKETEXT chains.
+func (ce *CorrelationEngine) checkProcessInjection(sourcePID int, apiName string, args map[string]interface{}, t time.Time) {
+	targetPID := extractTargetPID(args)
+	if targetPID == 0 || targetPID == sourcePID {
+		return
+	}
+	if ce.injectionMap[sourcePID] == nil {
+		ce.injectionMap[sourcePID] = make(map[int]bool)
+	}
+	lower := strings.ToLower(apiName)
+	if strings.Contains(lower, "writeprocessmemory") ||
+		strings.Contains(lower, "virtualallocex") ||
+		strings.Contains(lower, "ptrace_poketext") {
+		ce.injectionMap[sourcePID][targetPID] = true
+	}
+	if strings.Contains(lower, "createremotethread") ||
+		strings.Contains(lower, "ptrace_attach") ||
+		strings.Contains(lower, "ptrace_seize") {
+		if ce.injectionMap[sourcePID][targetPID] {
+			ce.emitAlert(sourcePID, "T1055.001", "Process Injection Attack Sequence",
+				fmt.Sprintf("PID(%d) performed alloc/write then %s on PID(%d)",
+					sourcePID, apiName, targetPID),
+				SevCritical, t)
+		} else {
+			ce.emitAlert(sourcePID, "T1055", "Suspicious Cross-Process API",
+				fmt.Sprintf("PID(%d) called %s on PID(%d)",
+					sourcePID, apiName, targetPID),
+				SevHigh, t)
+		}
+	}
+}
+
+// checkPersistenceToC2 fires when a persistence write is followed by a network connection.
+func (ce *CorrelationEngine) checkPersistenceToC2(pid int, objectPath, objType string, t time.Time) {
+	lower := strings.ToLower(objectPath)
+	var isPersistence bool
+	if objType == "registry" {
+		isPersistence = strings.Contains(lower, `\run`) ||
+			strings.Contains(lower, `\runonce`) ||
+			strings.Contains(lower, `\currentversion\services`) ||
+			strings.Contains(lower, `\taskcache\`)
+	} else if objType == "file" {
+		isPersistence = strings.Contains(lower, `\startup\`) ||
+			strings.Contains(lower, "/etc/cron") ||
+			strings.Contains(lower, "/etc/systemd/system") ||
+			strings.Contains(lower, "/etc/rc.local") ||
+			strings.Contains(lower, "/.bashrc") ||
+			strings.Contains(lower, "/.profile") ||
+			strings.Contains(lower, "/etc/profile")
+	}
 	if !isPersistence {
 		return
 	}
-
-	// Check if this process already has network connections in history
-	if conns, ok := ce.netConns[pid]; ok && len(conns) > 0 {
+	if conns := ce.netConns[pid]; len(conns) > 0 {
 		ce.emitAlert(pid, "T1547", "Persistence and Outbound Connection",
-			fmt.Sprintf("Process (%d) registered persistence via '%s' and has active network connections to %v",
+			fmt.Sprintf("PID(%d) wrote persistence '%s' and has active connections %v",
 				pid, objectPath, conns),
 			SevHigh, t)
 	}
 }
 
-// checkC2Aftermath checks if an outbound connection correlates with recent persistence activity.
+// checkC2Aftermath fires when outbound network follows earlier persistence.
 func (ce *CorrelationEngine) checkC2Aftermath(pid int, dest string, t time.Time) {
-	// Check if this process previously wrote persistence files or keys
-	hasPersistence := false
 	var item string
-
 	for _, reg := range ce.regWrites[pid] {
-		lowerReg := strings.ToLower(reg)
-		if strings.Contains(lowerReg, `\run`) || strings.Contains(lowerReg, `\runonce`) || strings.Contains(lowerReg, `\currentversion\services`) {
-			hasPersistence = true
+		lower := strings.ToLower(reg)
+		if strings.Contains(lower, `\run`) ||
+			strings.Contains(lower, `\runonce`) ||
+			strings.Contains(lower, `\currentversion\services`) {
 			item = reg
 			break
 		}
 	}
-
-	if !hasPersistence {
-		for _, file := range ce.fileWrites[pid] {
-			lowerFile := strings.ToLower(file)
-			if strings.Contains(lowerFile, `\startup\`) || strings.Contains(lowerFile, "/etc/cron") || strings.Contains(lowerFile, "/etc/systemd/system") {
-				hasPersistence = true
-				item = file
+	if item == "" {
+		for _, f := range ce.fileWrites[pid] {
+			lower := strings.ToLower(f)
+			if strings.Contains(lower, `\startup\`) ||
+				strings.Contains(lower, "/etc/cron") ||
+				strings.Contains(lower, "/etc/systemd/system") ||
+				strings.Contains(lower, "/.bashrc") ||
+				strings.Contains(lower, "/.profile") {
+				item = f
 				break
 			}
 		}
 	}
-
-	if hasPersistence {
+	if item != "" {
 		ce.emitAlert(pid, "T1071.001", "C2 Beaconing from Persistent Process",
-			fmt.Sprintf("Process (%d) initiated outbound network connection to %s after establishing persistence in '%s'",
+			fmt.Sprintf("PID(%d) connected to %s after writing persistence in '%s'",
 				pid, dest, item),
 			SevCritical, t)
 	}
 }
 
-// checkReflectiveInjection alerts when a PE image is mapped into a process
-// without a disk-backed file, which is the hallmark of reflective DLL injection.
-// Mapped to MITRE T1055.002.
 func (ce *CorrelationEngine) checkReflectiveInjection(pid int, imageName string, t time.Time) {
-	ce.emitAlert(pid, "T1055.002", "Reflective DLL Injection Detected",
-		fmt.Sprintf("Process (%d) loaded an image '%s' with no disk-backed file — reflective injection pattern",
-			pid, imageName),
+	ce.emitAlert(pid, "T1055.002", "Reflective DLL Injection",
+		fmt.Sprintf("PID(%d) loaded '%s' with no disk backing", pid, imageName),
 		SevCritical, t)
 }
 
-// checkLSASSAccess alerts when a process opens or duplicates a handle to lsass.exe.
-// This is a necessary prerequisite for credential dumping tools such as Mimikatz.
-// Mapped to MITRE T1003.001.
 func (ce *CorrelationEngine) checkLSASSAccess(pid int, objectType, objectName string, t time.Time) {
 	if !strings.Contains(strings.ToLower(objectName), "lsass") {
 		return
 	}
-	ce.emitAlert(pid, "T1003.001", "LSASS Handle Access Detected",
-		fmt.Sprintf("Process (%d) opened a '%s' handle to '%s' — potential credential dumping precursor",
-			pid, objectType, objectName),
+	ce.emitAlert(pid, "T1003.001", "LSASS Handle Access",
+		fmt.Sprintf("PID(%d) opened '%s' handle to '%s'", pid, objectType, objectName),
 		SevCritical, t)
 }
 
-func (ce *CorrelationEngine) emitAlert(pid int, ttp string, technique string, details string, severity int, t time.Time) {
+func (ce *CorrelationEngine) emitAlert(pid int, ttp, technique, details string, severity int, t time.Time) {
 	alert := Event{
 		JobID:     ce.jobID,
 		Timestamp: t,
@@ -390,10 +428,40 @@ func (ce *CorrelationEngine) emitAlert(pid int, ttp string, technique string, de
 			"mitre_ttp": ttp,
 		},
 	}
-	
-	// Non-blocking write to alert channel
 	select {
 	case ce.alerts <- alert:
 	default:
 	}
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+func buildDestString(ev Event) string {
+	dest := ""
+	if ip, ok := ev.Data["dest_ip"].(string); ok {
+		dest = ip
+		if port, ok := ev.Data["dest_port"].(int); ok && port != 0 {
+			dest = fmt.Sprintf("%s:%d", dest, port)
+		} else if portf, ok := ev.Data["dest_port"].(float64); ok {
+			dest = fmt.Sprintf("%s:%d", dest, int(portf))
+		}
+	}
+	if domain, ok := ev.Data["domain"].(string); ok && domain != "" {
+		if dest == "" {
+			dest = domain
+		} else {
+			dest = fmt.Sprintf("%s (%s)", dest, domain)
+		}
+	}
+	return dest
+}
+
+func extractTargetPID(args map[string]interface{}) int {
+	if v, ok := args["target_pid"].(int); ok {
+		return v
+	}
+	if v, ok := args["target_pid"].(float64); ok {
+		return int(v)
+	}
+	return 0
 }
