@@ -10,11 +10,17 @@ import (
 )
 
 type YaraScanner struct {
-	rulesDir string
+	rulesDir      string
+	externalRules *ExternalYaraRules
 }
 
 func NewYaraScanner(rulesDir string) (*YaraScanner, error) {
-	return &YaraScanner{rulesDir: rulesDir}, nil
+	ext, loadErrs := LoadYaraRules(rulesDir)
+	for _, e := range loadErrs {
+		// Log parse errors but don't fail — built-in rules still work.
+		_ = e
+	}
+	return &YaraScanner{rulesDir: rulesDir, externalRules: ext}, nil
 }
 
 // CalculateEntropy calculates the Shannon entropy of a byte slice (0.0 to 8.0)
@@ -45,7 +51,6 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 	if err != nil {
 		return hits
 	}
-
 	// 1. Check for executable headers
 	isPE := len(data) > 2 && data[0] == 'M' && data[1] == 'Z'
 
@@ -162,6 +167,11 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 		})
 	}
 
+	// External .yar rules
+	if y.externalRules != nil {
+		hits = append(hits, y.externalRules.MatchFile(path, data)...)
+	}
+
 	return hits
 }
 
@@ -207,6 +217,11 @@ func (y *YaraScanner) ScanMemory(pid int, address string, data []byte) []RuleHit
 			MatchedOn:   fmt.Sprintf("PID %d Address %s", pid, address),
 			Evidence:    "Matched string: mimikatz",
 		})
+	}
+
+	// External .yar rules
+	if y.externalRules != nil {
+		hits = append(hits, y.externalRules.MatchMemory(pid, address, data)...)
 	}
 
 	return hits

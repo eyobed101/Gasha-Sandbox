@@ -1,0 +1,17 @@
+title: Scheduled Task Created for Persistence
+id: 7f9c2e1a-3b4d-5678-ef01-234567890bcd
+status: stable
+description: Detects schtasks.exe used to create a scheduled task for persistence
+level: high
+tags:
+    - attack.persistence
+    - attack.t1053.005
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection:
+        CommandLine|contains:
+            - 'schtasks'
+            - '/create'
+    condition: selection

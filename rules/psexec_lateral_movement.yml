@@ -1,0 +1,18 @@
+title: PsExec Remote Execution
+id: 4d4b8e4e-b5c1-4f63-a5ac-c0b6d5e7f123
+status: stable
+description: Detects PsExec usage for remote lateral movement based on process cmdline
+level: high
+tags:
+    - attack.lateral_movement
+    - attack.t1021.002
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection:
+        CommandLine|contains:
+            - 'psexec'
+            - 'PsExec64'
+            - 'psexesvc'
+    condition: selection

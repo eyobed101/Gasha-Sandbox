@@ -28,7 +28,7 @@ func NewEngine(rulesDir string) (*Engine, error) {
 		return nil, err
 	}
 
-	sigmaCorr, err := NewSigmaCorrelator()
+	sigmaCorr, err := NewSigmaCorrelatorWithDir(rulesDir)
 	if err != nil {
 		return nil, err
 	}

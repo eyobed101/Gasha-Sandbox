@@ -202,6 +202,11 @@ func (y *YaraScanner) ScanScript(content []byte, sourcePath string) []RuleHit {
 		hits = append(hits, subHits...)
 	}
 
+	// 4. External .yar rules applied to script content
+	if y.externalRules != nil {
+		hits = append(hits, y.externalRules.MatchScript(content, sourcePath)...)
+	}
+
 	return hits
 }
 

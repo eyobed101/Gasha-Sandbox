@@ -7,10 +7,18 @@ import (
 	"github.com/lemas-sandbox/lemas/pkg/monitor"
 )
 
-type SigmaCorrelator struct{}
+type SigmaCorrelator struct {
+	external *ExternalSigmaRules
+}
 
 func NewSigmaCorrelator() (*SigmaCorrelator, error) {
 	return &SigmaCorrelator{}, nil
+}
+
+// NewSigmaCorrelatorWithDir creates a correlator that also loads external .yml rules from dir.
+func NewSigmaCorrelatorWithDir(rulesDir string) (*SigmaCorrelator, error) {
+	ext, _ := LoadSigmaRules(rulesDir) // parse errors are non-fatal
+	return &SigmaCorrelator{external: ext}, nil
 }
 
 // Evaluate performs signature and behavioral pattern matching on single events or chains.
@@ -269,6 +277,11 @@ func (s *SigmaCorrelator) Evaluate(ev monitor.Event) []RuleHit {
 			MatchedOn:   tech,
 			Evidence:    details,
 		})
+	}
+
+	// External .yml Sigma rules evaluated against every event
+	if s.external != nil {
+		hits = append(hits, s.external.Evaluate(ev)...)
 	}
 
 	return hits

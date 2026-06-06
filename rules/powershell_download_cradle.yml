@@ -1,0 +1,16 @@
+title: PowerShell Suspicious Download Cradle
+id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+status: stable
+description: Detects PowerShell script blocks that download and execute remote content
+level: critical
+tags:
+    - attack.execution
+    - attack.t1105
+logsource:
+    category: ps_script
+    product: windows
+detection:
+    keywords:
+        - 'DownloadString'
+        - 'WebClient'
+    condition: all of keywords
