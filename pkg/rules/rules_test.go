@@ -28,7 +28,7 @@ func TestCalculateEntropyHigh(t *testing.T) {
 }
 
 func TestScanFileNotExist(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	hits := scanner.ScanFile("nonexistent_file_xyz.exe")
 	if len(hits) != 0 {
 		t.Errorf("expected 0 hits for missing file, got %d", len(hits))
@@ -42,7 +42,7 @@ func TestScanFileScriptExtension(t *testing.T) {
 	f.Close()
 	defer os.Remove(f.Name())
 
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	hits := scanner.ScanFile(f.Name())
 
 	found := false
@@ -57,7 +57,7 @@ func TestScanFileScriptExtension(t *testing.T) {
 }
 
 func TestScanMemoryMZHeader(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	data := make([]byte, 8192)
 	data[0] = 'M'
 	data[1] = 'Z'
@@ -75,7 +75,7 @@ func TestScanMemoryMZHeader(t *testing.T) {
 }
 
 func TestScanMemoryMimikatz(t *testing.T) {
-	scanner, _ := rules.NewYaraScanner(".")
+	scanner, _ := rules.NewYaraScanner("")
 	data := []byte("some garbage before mimikatz string here")
 
 	hits := scanner.ScanMemory(999, "0x0", data)

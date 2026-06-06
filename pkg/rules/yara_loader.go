@@ -93,6 +93,10 @@ func LoadYaraRules(dir string) (*ExternalYaraRules, []error) {
 	var out ExternalYaraRules
 	var errs []error
 
+	if dir == "" {
+		return &out, nil
+	}
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return &out, nil

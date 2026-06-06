@@ -136,6 +136,10 @@ func LoadSigmaRules(dir string) (*ExternalSigmaRules, []error) {
 	var out ExternalSigmaRules
 	var errs []error
 
+	if dir == "" {
+		return &out, nil
+	}
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return &out, nil

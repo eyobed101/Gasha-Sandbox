@@ -19,7 +19,8 @@ import (
 	"github.com/lemas-sandbox/lemas/pkg/rules"
 )
 
-const rulesDir = "../../rules"
+const rulesDir = "../../rules/yara"
+const sigmaRulesDir = "../../rules/sigma"
 
 // writeRule creates a temp .yar or .yml file in a temp dir, returns the dir path.
 func writeTempRule(t *testing.T, filename, content string) string {
@@ -273,7 +274,7 @@ rule TwoOfThree {
 // ─── Sigma: existing rules from rules/ dir ────────────────────────────────────
 
 func TestExternalSigmaDownloadCradle(t *testing.T) {
-	corr, err := rules.NewSigmaCorrelatorWithDir(rulesDir)
+	corr, err := rules.NewSigmaCorrelatorWithDir(sigmaRulesDir)
 	if err != nil {
 		t.Fatalf("NewSigmaCorrelatorWithDir: %v", err)
 	}
@@ -303,7 +304,7 @@ func TestExternalSigmaDownloadCradle(t *testing.T) {
 }
 
 func TestExternalSigmaLSASSRead(t *testing.T) {
-	corr, _ := rules.NewSigmaCorrelatorWithDir(rulesDir)
+	corr, _ := rules.NewSigmaCorrelatorWithDir(sigmaRulesDir)
 	ev := monitor.Event{
 		JobID:     "ext-test",
 		Timestamp: time.Now(),
@@ -328,7 +329,7 @@ func TestExternalSigmaLSASSRead(t *testing.T) {
 }
 
 func TestExternalSigmaPsExec(t *testing.T) {
-	corr, _ := rules.NewSigmaCorrelatorWithDir(rulesDir)
+	corr, _ := rules.NewSigmaCorrelatorWithDir(sigmaRulesDir)
 	ev := monitor.Event{
 		JobID:     "ext-test",
 		Timestamp: time.Now(),
