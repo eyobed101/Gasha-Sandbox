@@ -1,26 +1,23 @@
 package rules
 
-// yara_loader.go — loads external .yar / .yara rule files from a directory and
-// compiles them into RuleHit generators compatible with ScanFile, ScanMemory,
-// and ScanScript.
+// yara_loader.go — loads external .yar / .yara rule files from a directory.
 //
-// Supported YARA syntax subset:
-//   rule <name> [: <tag> ...] {
-//       meta:
-//           description = "..."
-//           severity    = "high"        // informational|low|medium|high|critical
-//           mitre       = "T1055.001"
-//       strings:
-//           $s1 = "literal string"      // plain or nocase
-//           $s2 = { 4D 5A ?? 00 }       // hex bytes (? and ?? as wildcards)
-//       condition:
-//           any of them
-//   }
+// Supported string types:
+//   $s = "literal"            plain string
+//   $s = "literal" nocase     case-insensitive
+//   $s = "literal" wide       UTF-16LE (searched as-is after encoding)
+//   $s = { 4D 5A ?? 00 }      hex with ? / ?? wildcards
+//   $s = /regex/              RE2 regex (optionally /regex/i for case-insensitive)
 //
-// Limitations (intentional — keeps this zero-dependency):
-//   • Only "any of them" / "all of them" / "N of them" conditions are evaluated.
-//   • Regex strings ($s = /pattern/) are not supported; use literal strings.
-//   • Only the first 64 KB of scanned content is matched for performance.
+// Supported conditions:
+//   any of them
+//   all of them
+//   N of them
+//   any of ($prefix*)         named pattern group
+//   $s1 and $s2               boolean AND of individual patterns
+//   $s1 or  $s2               boolean OR  of individual patterns
+//
+// Scan cap: first 512 KB of content for performance.
 
 import (
 	"bufio"
@@ -28,50 +25,78 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 )
 
-// ExternalYaraRule is the compiled form of one rule from a .yar file.
+const yaraScanCap = 512 * 1024
+
+// patternKind distinguishes how a pattern is matched.
+type patternKind uint8
+
+const (
+	kindLiteral patternKind = iota
+	kindHex
+	kindRegex
+)
+
+// yaraPattern holds one compiled $string definition.
+type yaraPattern struct {
+	id      string
+	kind    patternKind
+	literal []byte         // kindLiteral and kindHex
+	re      *regexp.Regexp // kindRegex
+	nocase  bool
+	wide    bool           // match UTF-16LE encoded form as well
+	// hex wildcard mask: same length as literal; 0xFF = exact, 0x00 = wildcard byte
+	hexMask []byte
+}
+
+// ExternalYaraRule is the compiled form of one parsed rule.
 type ExternalYaraRule struct {
 	Name        string
 	Description string
 	Severity    string
 	MITRETTP    string
 	Tags        []string
-	// compiled pattern matchers
 	patterns    []yaraPattern
-	// condition: "any" or "all" or N (minimum count)
-	minMatches  int
+	condition   yaraCondition
 }
 
-type yaraPattern struct {
-	id       string // $s1
-	literal  []byte // plain text or decoded hex
-	nocase   bool
-	isHex    bool
+// yaraCondition describes how patterns must match.
+type yaraCondition struct {
+	mode        condMode // modeAny / modeAll / modeCount / modeBoolExpr
+	minCount    int      // for modeCount
+	groupPrefix string   // for modeAny/modeAll over a named group ($prefix*)
+	boolTokens  []string // raw tokens for modeBoolean ("$s1","and","$s2", ...)
 }
 
-// ExternalYaraRules is the set loaded from disk. YaraScanner embeds this.
+type condMode uint8
+
+const (
+	modeAny      condMode = iota // any of them (default)
+	modeAll                      // all of them
+	modeCount                    // N of them
+	modeBoolExpr                 // $s1 and $s2 / $s1 or $s2
+)
+
+// ExternalYaraRules is the loaded + compiled rule set.
 type ExternalYaraRules struct {
 	rules []ExternalYaraRule
 }
 
-// LoadYaraRules loads all .yar and .yara files from dir.
-// Errors on individual files are collected and returned as a combined non-fatal
-// error; successfully parsed rules are returned regardless.
+// ─── Public API ──────────────────────────────────────────────────────────────
+
 func LoadYaraRules(dir string) (*ExternalYaraRules, []error) {
-	var (
-		out  ExternalYaraRules
-		errs []error
-	)
+	var out ExternalYaraRules
+	var errs []error
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		// Directory may not exist yet — not fatal, just no external rules.
 		return &out, nil
 	}
-
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -81,90 +106,221 @@ func LoadYaraRules(dir string) (*ExternalYaraRules, []error) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
-		rules, parseErrs := parseYaraFile(path)
+		loaded, parseErrs := parseYaraFile(path)
 		errs = append(errs, parseErrs...)
-		out.rules = append(out.rules, rules...)
+		out.rules = append(out.rules, loaded...)
 	}
-
 	return &out, errs
 }
 
-// MatchFile runs external rules against raw file bytes.
 func (ey *ExternalYaraRules) MatchFile(path string, data []byte) []RuleHit {
 	return ey.match(data, path)
 }
 
-// MatchMemory runs external rules against a memory buffer.
 func (ey *ExternalYaraRules) MatchMemory(pid int, address string, data []byte) []RuleHit {
-	label := fmt.Sprintf("PID %d @ %s", pid, address)
-	return ey.match(data, label)
+	return ey.match(data, fmt.Sprintf("PID %d @ %s", pid, address))
 }
 
-// MatchScript runs external rules against a script block.
 func (ey *ExternalYaraRules) MatchScript(content []byte, label string) []RuleHit {
 	return ey.match(content, label)
 }
 
+// ─── Matching engine ─────────────────────────────────────────────────────────
+
 func (ey *ExternalYaraRules) match(data []byte, label string) []RuleHit {
-	// Cap to 64 KB for performance
 	buf := data
-	if len(buf) > 65536 {
-		buf = buf[:65536]
+	if len(buf) > yaraScanCap {
+		buf = buf[:yaraScanCap]
 	}
 	lowerBuf := bytes.ToLower(buf)
 
 	var hits []RuleHit
 	for _, rule := range ey.rules {
-		matched := 0
-		var evidence strings.Builder
-
-		for _, p := range rule.patterns {
-			var found bool
-			if p.nocase || p.isHex {
-				found = bytes.Contains(lowerBuf, bytes.ToLower(p.literal))
-			} else {
-				found = bytes.Contains(buf, p.literal)
-			}
-			if found {
-				matched++
-				if evidence.Len() > 0 {
-					evidence.WriteString(", ")
-				}
-				evidence.WriteString(p.id)
-			}
-		}
-
 		if len(rule.patterns) == 0 {
 			continue
 		}
 
-		triggered := false
-		switch rule.minMatches {
-		case 0: // "any of them"
-			triggered = matched > 0
-		case -1: // "all of them"
-			triggered = matched == len(rule.patterns)
-		default:
-			triggered = matched >= rule.minMatches
+		// Evaluate each pattern once, build match set
+		matchSet := make(map[string]bool, len(rule.patterns))
+		for _, p := range rule.patterns {
+			matchSet[p.id] = matchPattern(p, buf, lowerBuf)
 		}
 
+		triggered, evidence := evalCondition(rule.condition, rule.patterns, matchSet)
 		if triggered {
-			sev := rule.Severity
-			if sev == "" {
-				sev = "medium"
-			}
 			hits = append(hits, RuleHit{
 				RuleName:    rule.Name,
 				Engine:      "yara-external",
 				Description: rule.Description,
-				Severity:    sev,
+				Severity:    nonEmpty(rule.Severity, "medium"),
 				MITRETTP:    rule.MITRETTP,
 				MatchedOn:   label,
-				Evidence:    fmt.Sprintf("Matched strings: %s", evidence.String()),
+				Evidence:    "Matched: " + evidence,
 			})
 		}
 	}
 	return hits
+}
+
+// matchPattern returns true if pattern p matches inside buf (lowerBuf pre-computed).
+func matchPattern(p yaraPattern, buf, lowerBuf []byte) bool {
+	switch p.kind {
+	case kindRegex:
+		if p.re == nil {
+			return false
+		}
+		return p.re.Match(buf)
+
+	case kindHex:
+		return matchHexWithMask(buf, p.literal, p.hexMask)
+
+	default: // kindLiteral
+		target := buf
+		needle := p.literal
+		if p.nocase {
+			target = lowerBuf
+			needle = bytes.ToLower(p.literal)
+		}
+		if bytes.Contains(target, needle) {
+			return true
+		}
+		// wide: also check UTF-16LE encoded form
+		if p.wide {
+			wide := toUTF16LE(p.literal)
+			if bytes.Contains(buf, wide) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// matchHexWithMask performs byte-by-byte matching respecting 0x00 wildcard mask entries.
+func matchHexWithMask(data, pattern, mask []byte) bool {
+	if len(pattern) == 0 {
+		return true
+	}
+	pLen := len(pattern)
+	outer:
+	for i := 0; i <= len(data)-pLen; i++ {
+		for j := 0; j < pLen; j++ {
+			if mask != nil && j < len(mask) && mask[j] == 0x00 {
+				continue // wildcard byte — skip
+			}
+			if data[i+j] != pattern[j] {
+				continue outer
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// evalCondition decides whether the rule fires given the match set.
+func evalCondition(cond yaraCondition, patterns []yaraPattern, matchSet map[string]bool) (bool, string) {
+	var matched []string
+	for id, ok := range matchSet {
+		if ok {
+			matched = append(matched, id)
+		}
+	}
+	evidence := strings.Join(matched, ", ")
+
+	switch cond.mode {
+	case modeAll:
+		return len(matched) == len(patterns), evidence
+
+	case modeCount:
+		return len(matched) >= cond.minCount, evidence
+
+	case modeBoolExpr:
+		result := evalBoolTokens(cond.boolTokens, matchSet)
+		return result, evidence
+
+	default: // modeAny
+		if cond.groupPrefix != "" {
+			// any of ($prefix*)
+			for id, ok := range matchSet {
+				if ok && strings.HasPrefix(id, cond.groupPrefix) {
+					return true, id
+				}
+			}
+			return false, ""
+		}
+		return len(matched) > 0, evidence
+	}
+}
+
+// evalBoolTokens evaluates a flat token list like ["$s1","and","$s2","or","$s3"]
+// with left-to-right evaluation (AND binds tighter than OR in this simple model).
+func evalBoolTokens(tokens []string, matchSet map[string]bool) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	// Split on "or" first, then evaluate each "and" clause
+	orClauses := splitTokens(tokens, "or")
+	for _, clause := range orClauses {
+		andTerms := splitTokens(clause, "and")
+		allTrue := true
+		for _, termSlice := range andTerms {
+			if len(termSlice) == 0 {
+				continue
+			}
+			t := strings.TrimSpace(termSlice[0])
+			if t == "" {
+				continue
+			}
+			if strings.HasPrefix(t, "not ") {
+				sub := strings.TrimPrefix(t, "not ")
+				if matchSet[sub] {
+					allTrue = false
+					break
+				}
+			} else {
+				if !matchSet[t] {
+					allTrue = false
+					break
+				}
+			}
+		}
+		if allTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func splitTokens(tokens []string, sep string) [][]string {
+	var out [][]string
+	var cur []string
+	for _, t := range tokens {
+		if strings.ToLower(strings.TrimSpace(t)) == sep {
+			out = append(out, cur)
+			cur = nil
+		} else {
+			cur = append(cur, t)
+		}
+	}
+	out = append(out, cur)
+	return out
+}
+
+func toUTF16LE(ascii []byte) []byte {
+	runes := []rune(string(ascii))
+	u16 := utf16.Encode(runes)
+	out := make([]byte, len(u16)*2)
+	for i, v := range u16 {
+		out[i*2] = byte(v)
+		out[i*2+1] = byte(v >> 8)
+	}
+	return out
+}
+
+func nonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // ─── Parser ──────────────────────────────────────────────────────────────────
@@ -176,35 +332,31 @@ func parseYaraFile(path string) ([]ExternalYaraRule, []error) {
 	}
 	defer f.Close()
 
-	var (
-		rules    []ExternalYaraRule
-		errs     []error
-		lines    []string
-	)
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+	var lines []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
 	}
-	if err := scanner.Err(); err != nil {
+	if err := sc.Err(); err != nil {
 		return nil, []error{fmt.Errorf("yara_loader: read %s: %w", path, err)}
 	}
 
+	var (
+		rules []ExternalYaraRule
+		errs  []error
+	)
 	i := 0
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
-
-		// Skip blank lines and comments
-		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") {
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") {
 			i++
 			continue
 		}
-
-		// Match rule header: "rule RuleName" or "rule RuleName : tag1 tag2"
-		if strings.HasPrefix(line, "rule ") {
+		if strings.HasPrefix(line, "rule ") || strings.HasPrefix(line, "private rule ") || strings.HasPrefix(line, "global rule ") {
 			rule, advance, parseErr := parseRuleBlock(lines, i)
 			if parseErr != nil {
-				errs = append(errs, fmt.Errorf("yara_loader: %s: %w", path, parseErr))
+				errs = append(errs, fmt.Errorf("%s: %w", path, parseErr))
 				i++
 				continue
 			}
@@ -214,53 +366,50 @@ func parseYaraFile(path string) ([]ExternalYaraRule, []error) {
 			i++
 		}
 	}
-
 	return rules, errs
 }
 
-// parseRuleBlock reads from lines[start] (the "rule ..." header) through the
-// matching closing brace and returns the compiled rule plus the next line index.
 func parseRuleBlock(lines []string, start int) (ExternalYaraRule, int, error) {
 	header := strings.TrimSpace(lines[start])
-
-	// Extract rule name and optional tags
-	// e.g. "rule DetectMimikatz : credential_dumping"
+	// Strip modifiers
+	header = strings.TrimPrefix(header, "private ")
+	header = strings.TrimPrefix(header, "global ")
 	after, _ := strings.CutPrefix(header, "rule ")
+
+	// Split on ":" for tags, then strip trailing "{"
 	parts := strings.SplitN(after, ":", 2)
-	ruleName := strings.TrimSpace(parts[0])
-	// Remove trailing "{" if on same line
-	ruleName = strings.TrimSuffix(ruleName, "{")
-	ruleName = strings.TrimSpace(ruleName)
+	ruleName := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[0]), "{"))
 
 	var tags []string
 	if len(parts) == 2 {
-		for _, t := range strings.Fields(strings.TrimRight(parts[1], " {")) {
+		tagPart := strings.TrimRight(parts[1], " {")
+		for _, t := range strings.Fields(tagPart) {
 			tags = append(tags, t)
 		}
 	}
 
 	rule := ExternalYaraRule{
-		Name:       ruleName,
-		Tags:       tags,
-		minMatches: 0, // default: any of them
+		Name: ruleName,
+		Tags: tags,
+		condition: yaraCondition{mode: modeAny},
 	}
 
 	// Find opening brace
 	i := start
-	for i < len(lines) {
-		if strings.Contains(lines[i], "{") {
-			break
-		}
+	for i < len(lines) && !strings.Contains(lines[i], "{") {
 		i++
 	}
-	i++ // move past opening brace
+	i++ // past "{"
 
 	section := ""
+	var condLines []string
 
 	for i < len(lines) {
-		line := strings.TrimSpace(lines[i])
+		raw := lines[i]
+		line := strings.TrimSpace(raw)
 
 		if line == "}" {
+			rule.condition = parseConditionExpr(condLines, rule.patterns)
 			return rule, i + 1, nil
 		}
 		if line == "" || strings.HasPrefix(line, "//") {
@@ -268,40 +417,89 @@ func parseRuleBlock(lines []string, start int) (ExternalYaraRule, int, error) {
 			continue
 		}
 
-		// Section markers
-		if strings.HasPrefix(line, "meta:") {
+		switch {
+		case strings.HasPrefix(line, "meta:"):
 			section = "meta"
-			i++
-			continue
-		}
-		if strings.HasPrefix(line, "strings:") {
+		case strings.HasPrefix(line, "strings:"):
 			section = "strings"
-			i++
-			continue
-		}
-		if strings.HasPrefix(line, "condition:") {
+		case strings.HasPrefix(line, "condition:"):
 			section = "condition"
-			i++
-			continue
-		}
-
-		switch section {
-		case "meta":
-			parseMetaLine(line, &rule)
-
-		case "strings":
-			if p, err := parseStringLine(line); err == nil {
-				rule.patterns = append(rule.patterns, p)
+			// Condition may start on same line: "condition: any of them"
+			rest := strings.TrimSpace(strings.TrimPrefix(line, "condition:"))
+			if rest != "" {
+				condLines = append(condLines, rest)
 			}
-
-		case "condition":
-			rule.minMatches = parseCondition(line, len(rule.patterns))
+		default:
+			switch section {
+			case "meta":
+				parseMetaLine(line, &rule)
+			case "strings":
+				if p, err := parseStringLine(line); err == nil {
+					rule.patterns = append(rule.patterns, p)
+				}
+			case "condition":
+				condLines = append(condLines, line)
+			}
 		}
-
 		i++
 	}
-
 	return rule, i, fmt.Errorf("rule %q: missing closing brace", ruleName)
+}
+
+// parseConditionExpr builds a yaraCondition from raw condition lines.
+func parseConditionExpr(lines []string, patterns []yaraPattern) yaraCondition {
+	expr := strings.ToLower(strings.Join(lines, " "))
+	expr = strings.TrimSpace(expr)
+
+	// "all of them"
+	if strings.Contains(expr, "all of them") {
+		return yaraCondition{mode: modeAll}
+	}
+	// "any of ($prefix*)"
+	if idx := strings.Index(expr, "any of ($"); idx >= 0 {
+		end := strings.Index(expr[idx:], ")")
+		if end >= 0 {
+			inner := expr[idx+9 : idx+end]
+			prefix := strings.TrimSuffix(inner, "*")
+			return yaraCondition{mode: modeAny, groupPrefix: "$" + prefix}
+		}
+	}
+	// "any of them" or bare "any of"
+	if strings.Contains(expr, "any of them") || expr == "any of" {
+		return yaraCondition{mode: modeAny}
+	}
+	// "N of them"
+	fields := strings.Fields(expr)
+	for idx, f := range fields {
+		if f == "of" && idx > 0 {
+			n, err := strconv.Atoi(fields[idx-1])
+			if err == nil {
+				return yaraCondition{mode: modeCount, minCount: n}
+			}
+		}
+	}
+	// Boolean expression: "$s1 and $s2 or not $s3"
+	hasBool := strings.Contains(expr, " and ") || strings.Contains(expr, " or ") || strings.Contains(expr, "not ")
+	hasPattern := strings.Contains(expr, "$")
+	if hasBool && hasPattern {
+		tokens := tokeniseBoolExpr(expr)
+		return yaraCondition{mode: modeBoolExpr, boolTokens: tokens}
+	}
+	// Fallback: any of them
+	return yaraCondition{mode: modeAny}
+}
+
+func tokeniseBoolExpr(expr string) []string {
+	// Split into words but keep $ identifiers intact
+	raw := strings.Fields(expr)
+	var tokens []string
+	for _, w := range raw {
+		w = strings.Trim(w, "()")
+		if w != "" {
+			tokens = append(tokens, w)
+		}
+	}
+	return tokens
 }
 
 func parseMetaLine(line string, rule *ExternalYaraRule) {
@@ -311,7 +509,6 @@ func parseMetaLine(line string, rule *ExternalYaraRule) {
 	}
 	key := strings.TrimSpace(kv[0])
 	val := strings.Trim(strings.TrimSpace(kv[1]), `"`)
-
 	switch key {
 	case "description", "desc":
 		rule.Description = val
@@ -322,87 +519,132 @@ func parseMetaLine(line string, rule *ExternalYaraRule) {
 	}
 }
 
+// parseStringLine parses a single YARA strings section line.
 func parseStringLine(line string) (yaraPattern, error) {
-	// $id = "value" [nocase]
-	// $id = { 4D 5A }
 	eq := strings.Index(line, "=")
 	if eq < 0 {
-		return yaraPattern{}, fmt.Errorf("no '=' in string definition")
+		return yaraPattern{}, fmt.Errorf("no '=' in string line")
 	}
 	id := strings.TrimSpace(line[:eq])
 	rest := strings.TrimSpace(line[eq+1:])
 
-	nocase := strings.Contains(strings.ToLower(rest), "nocase")
-	rest = strings.TrimSuffix(strings.ToLower(rest), "nocase")
-	rest = strings.TrimSpace(rest)
+	// ── Regex string: $s = /pattern/ or /pattern/i ──────────────────────────
+	if strings.HasPrefix(rest, "/") {
+		return parseRegexPattern(id, rest)
+	}
 
-	// Hex string: { 4D 5A ... }
-	if strings.HasPrefix(rest, "{") && strings.Contains(rest, "}") {
-		inner := rest[strings.Index(rest, "{")+1 : strings.LastIndex(rest, "}")]
-		literal, err := parseHexString(inner)
+	// ── Hex string: $s = { 4D 5A ?? } ──────────────────────────────────────
+	if strings.HasPrefix(rest, "{") {
+		end := strings.LastIndex(rest, "}")
+		if end < 0 {
+			return yaraPattern{}, fmt.Errorf("unclosed hex string for %s", id)
+		}
+		inner := rest[1:end]
+		literal, mask, err := parseHexString(inner)
 		if err != nil {
 			return yaraPattern{}, err
 		}
-		return yaraPattern{id: id, literal: literal, nocase: false, isHex: true}, nil
+		return yaraPattern{id: id, kind: kindHex, literal: literal, hexMask: mask}, nil
 	}
 
-	// Quoted literal
-	if (strings.HasPrefix(rest, `"`) && strings.Contains(rest[1:], `"`)) ||
-		(strings.HasPrefix(rest, `'`) && strings.Contains(rest[1:], `'`)) {
-		inner := rest[1:strings.LastIndex(rest, string(rest[0]))]
-		inner = unescapeYaraString(inner)
-		return yaraPattern{id: id, literal: []byte(inner), nocase: nocase}, nil
+	// ── Literal string: $s = "value" [nocase] [wide] ───────────────────────
+	quote := byte(0)
+	if strings.HasPrefix(rest, `"`) {
+		quote = '"'
+	} else if strings.HasPrefix(rest, "'") {
+		quote = '\''
+	}
+	if quote == 0 {
+		return yaraPattern{}, fmt.Errorf("unrecognised string syntax for %s", id)
 	}
 
-	return yaraPattern{}, fmt.Errorf("unrecognised string syntax: %s", line)
+	closeIdx := strings.LastIndexByte(rest[1:], quote)
+	if closeIdx < 0 {
+		return yaraPattern{}, fmt.Errorf("unclosed string literal for %s", id)
+	}
+	inner := rest[1 : closeIdx+1]
+	inner = unescapeYaraString(inner)
+	mods := strings.ToLower(rest[closeIdx+2:])
+
+	return yaraPattern{
+		id:      id,
+		kind:    kindLiteral,
+		literal: []byte(inner),
+		nocase:  strings.Contains(mods, "nocase"),
+		wide:    strings.Contains(mods, "wide"),
+	}, nil
 }
 
-func parseHexString(s string) ([]byte, error) {
-	var out []byte
+// parseRegexPattern compiles a YARA /regex/ or /regex/i string.
+func parseRegexPattern(id, rest string) (yaraPattern, error) {
+	// Find closing slash (not escaped)
+	closeIdx := -1
+	for i := 1; i < len(rest); i++ {
+		if rest[i] == '/' && rest[i-1] != '\\' {
+			closeIdx = i
+			break
+		}
+	}
+	if closeIdx < 0 {
+		return yaraPattern{}, fmt.Errorf("unclosed regex for %s", id)
+	}
+	pattern := rest[1:closeIdx]
+	flags := rest[closeIdx+1:]
+
+	if strings.Contains(flags, "i") {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return yaraPattern{}, fmt.Errorf("invalid regex %q for %s: %w", pattern, id, err)
+	}
+	return yaraPattern{id: id, kind: kindRegex, re: re}, nil
+}
+
+// parseHexString decodes a YARA hex string body into (bytes, mask).
+// mask[i] == 0x00 means byte i is a wildcard (?? or ?).
+func parseHexString(s string) ([]byte, []byte, error) {
+	// Normalise: remove comments /* ... */
+	for {
+		start := strings.Index(s, "/*")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(s[start:], "*/")
+		if end < 0 {
+			break
+		}
+		s = s[:start] + " " + s[start+end+2:]
+	}
+
+	var data, mask []byte
 	fields := strings.Fields(s)
 	for _, f := range fields {
-		// Wildcards: ? or ??
-		if f == "?" || f == "??" {
-			out = append(out, 0x00) // placeholder; wildcard matching skipped for now
+		// Jump notation [n-m] or [n] — skip
+		if strings.HasPrefix(f, "[") {
 			continue
 		}
-		// Skip jump notation [n-m]
-		if strings.HasPrefix(f, "[") {
+		// Full wildcard ??
+		if f == "??" {
+			data = append(data, 0x00)
+			mask = append(mask, 0x00)
+			continue
+		}
+		// Nibble wildcard: ?X or X?
+		if len(f) == 2 && (f[0] == '?' || f[1] == '?') {
+			// treat as wildcard byte
+			data = append(data, 0x00)
+			mask = append(mask, 0x00)
 			continue
 		}
 		b, err := strconv.ParseUint(f, 16, 8)
 		if err != nil {
-			return nil, fmt.Errorf("invalid hex byte %q: %w", f, err)
+			return nil, nil, fmt.Errorf("invalid hex byte %q: %w", f, err)
 		}
-		out = append(out, byte(b))
+		data = append(data, byte(b))
+		mask = append(mask, 0xFF)
 	}
-	return out, nil
-}
-
-func parseCondition(line string, patternCount int) int {
-	lower := strings.ToLower(strings.TrimSpace(line))
-	if strings.Contains(lower, "all of them") {
-		return -1 // sentinel for "all"
-	}
-	if strings.Contains(lower, "any of them") || strings.Contains(lower, "any of ($") {
-		return 0 // any
-	}
-	// "N of them"
-	fields := strings.Fields(lower)
-	for idx, f := range fields {
-		if f == "of" && idx > 0 {
-			n, err := strconv.Atoi(fields[idx-1])
-			if err == nil {
-				return n
-			}
-		}
-	}
-	// Fallback: if condition references $*, treat as any
-	if strings.Contains(lower, "of ($") || strings.Contains(lower, "$") {
-		return 0
-	}
-	_ = patternCount
-	return 0
+	return data, mask, nil
 }
 
 func unescapeYaraString(s string) string {
