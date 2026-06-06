@@ -4,16 +4,28 @@ import "time"
 
 // Event types
 const (
-	EventProcessCreate = "process_create"
-	EventProcessExit   = "process_exit"
-	EventFileWrite     = "file_write"
-	EventFileDelete    = "file_delete"
-	EventRegSet        = "registry_set"
-	EventRegDelete     = "registry_delete"
-	EventNetConnect    = "network_connect"
-	EventNetDNS        = "network_dns"
-	EventAPICall       = "api_call"
-	EventEvasion       = "evasion_attempt"
+	EventProcessCreate    = "process_create"
+	EventProcessExit      = "process_exit"
+	EventFileWrite        = "file_write"
+	EventFileDelete       = "file_delete"
+	EventRegSet           = "registry_set"
+	EventRegDelete        = "registry_delete"
+	EventNetConnect       = "network_connect"
+	EventNetDNS           = "network_dns"
+	EventAPICall          = "api_call"
+	EventEvasion          = "evasion_attempt"
+
+	// Task A — Thread + ImageLoad
+	EventThreadCreate = "thread_create" // Remote thread created in foreign process
+	EventImageLoad    = "image_load"    // DLL/module loaded into process
+
+	// Task B — Handle
+	EventHandleCreate    = "handle_create"    // Kernel object handle opened
+	EventHandleDuplicate = "handle_duplicate" // Handle duplicated across processes
+
+	// Task C — PowerShell / AMSI
+	EventPowerShell = "powershell_exec" // PowerShell script block logged
+	EventAMSIScan   = "amsi_scan"       // AMSI content scan triggered
 )
 
 // Categories
@@ -24,6 +36,8 @@ const (
 	CatNetwork  = "network"
 	CatAPI      = "api"
 	CatEvasion  = "evasion"
+	CatMemory   = "memory" // Task A: image/thread memory operations
+	CatScript   = "script" // Task C: PowerShell / AMSI script blocks
 )
 
 // Severities

@@ -144,6 +144,19 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 				allHits = append(allHits, sigmaHits...)
 				ruleHitsMu.Unlock()
 			}
+
+			// Task C: inline YARA scan for PowerShell script blocks and AMSI content
+			if ev.EventType == monitor.EventPowerShell || ev.EventType == monitor.EventAMSIScan {
+				if scriptBlock, ok := ev.Data["script_block"].(string); ok && len(scriptBlock) > 0 {
+					sourcePath := fmt.Sprintf("%s:PID-%d", ev.EventType, ev.PID)
+					scriptHits := o.rules.ScanScript([]byte(scriptBlock), sourcePath)
+					if len(scriptHits) > 0 {
+						ruleHitsMu.Lock()
+						allHits = append(allHits, scriptHits...)
+						ruleHitsMu.Unlock()
+					}
+				}
+			}
 		}
 	}()
 

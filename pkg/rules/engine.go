@@ -49,7 +49,14 @@ func (e *Engine) ScanMemory(pid int, address string, data []byte) []RuleHit {
 	return e.yaraEngine.ScanMemory(pid, address, data)
 }
 
-// ProcessEvents processes incoming telemetry streams in micro-batches and runs Sigma correlations.
+// ScanScript runs inline YARA-style signature analysis on raw script content
+// (PowerShell script blocks, AMSI scan buffers, etc.) without touching disk.
+// sourcePath is a human-readable context label used in hit evidence.
+func (e *Engine) ScanScript(content []byte, sourcePath string) []RuleHit {
+	return e.yaraEngine.ScanScript(content, sourcePath)
+}
+
+// ProcessEvent processes incoming telemetry events and runs Sigma correlations.
 func (e *Engine) ProcessEvent(ctx context.Context, ev monitor.Event) []RuleHit {
 	return e.sigmaEngine.Evaluate(ev)
 }

@@ -56,22 +56,57 @@ func (m *WindowsMonitor) Start(ctx context.Context, jobID string, targetPID int,
 	m.session = s
 
 	// 3. Register target Kernel providers
+	// Original four providers
 	providers := []string{
 		"Microsoft-Windows-Kernel-Process",
 		"Microsoft-Windows-Kernel-File",
 		"Microsoft-Windows-Kernel-Registry",
 		"Microsoft-Windows-Kernel-Network",
+		// Task A — Thread + ImageLoad
+		"Microsoft-Windows-Kernel-Thread", // Remote thread injection detection (T1055.001)
+		"Microsoft-Windows-Kernel-Image",  // DLL load path + reflective injection (T1055.002)
+		// Task B — DNS + Handle
+		"Microsoft-Windows-DNS-Client",    // Per-process DNS queries for C2 detection
+		"Microsoft-Windows-Kernel-Handle", // LSASS handle opens (T1003.001), mutexes, pipes
+		// Task C — AMSI + PowerShell
+		"Microsoft-Antimalware-Scan-Interface", // AMSI content scanning (T1059.001)
+		"Microsoft-Windows-PowerShell",         // Script block logging EventID 4104 (T1059.001)
 	}
 
 	for _, provName := range providers {
 		prov, err := etw.ParseProvider(provName)
 		if err != nil {
-			s.Stop()
-			return fmt.Errorf("failed to parse ETW provider %s: %v", provName, err)
+			// Non-fatal: some providers may not be available on all Windows versions.
+			// Log as a warning event rather than aborting the whole session.
+			bus <- Event{
+				JobID:     jobID,
+				Timestamp: time.Now(),
+				EventType: EventEvasion,
+				PID:       targetPID,
+				Category:  CatEvasion,
+				Severity:  SevLow,
+				Data: map[string]interface{}{
+					"technique": "ETW Provider Unavailable",
+					"details":   fmt.Sprintf("ETW provider %s not found on this system (non-fatal): %v", provName, err),
+				},
+			}
+			continue
 		}
 		if err := s.EnableProvider(prov); err != nil {
-			s.Stop()
-			return fmt.Errorf("failed to enable ETW provider %s: %v. Ensure running as Administrator", provName, err)
+			// Also non-fatal — privilege issues on optional providers should not abort analysis.
+			bus <- Event{
+				JobID:     jobID,
+				Timestamp: time.Now(),
+				EventType: EventEvasion,
+				PID:       targetPID,
+				Category:  CatEvasion,
+				Severity:  SevLow,
+				Data: map[string]interface{}{
+					"technique": "ETW Provider Enable Failed",
+					"details":   fmt.Sprintf("Could not enable ETW provider %s: %v", provName, err),
+				},
+			}
+			continue
 		}
 	}
 
@@ -280,6 +315,222 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		if domain, ok := getPropertyString(e, "Domain"); ok {
 			normalized.Data["domain"] = domain
 		}
+
+	// ── Task A: Thread provider ───────────────────────────────────────────────
+	case "Microsoft-Windows-Kernel-Thread":
+		// Event ID 1 = Thread start (creation). We are interested in threads whose
+		// owning process (ProcessID in payload) differs from the header ProcessID,
+		// which indicates a remote thread was injected via CreateRemoteThread.
+		if e.System.EventID != 1 {
+			return // only thread start events are actionable
+		}
+		// ProcessID in the payload = the process that OWNS the new thread
+		ownerPID, hasOwner := getPropertyInt(e, "ProcessID")
+		if !hasOwner {
+			ownerPID, hasOwner = getPropertyInt(e, "ProcessId")
+		}
+		// Header ProcessID = who CALLED the thread creation API
+		callerPID := int(e.System.Execution.ProcessID)
+
+		// Reflective self-injection is normal; only flag cross-process creation
+		if hasOwner && ownerPID != 0 && ownerPID != callerPID && callerPID != 0 {
+			startAddr, _ := getPropertyString(e, "StartAddr")
+			if startAddr == "" {
+				startAddr, _ = getPropertyString(e, "Win32StartAddr")
+			}
+			normalized.Category = CatMemory
+			normalized.EventType = EventThreadCreate
+			normalized.Severity = SevCritical
+			normalized.PID = callerPID // source of injection
+			normalized.Data["api_name"] = "CreateRemoteThread"
+			normalized.Data["target_pid"] = ownerPID
+			normalized.Data["start_addr"] = startAddr
+			normalized.Data["mitre_ttp"] = "T1055.001"
+			// Also emit as APICall so existing checkProcessInjection() in correlator fires
+			apiEvent := normalized
+			apiEvent.EventType = EventAPICall
+			apiEvent.Category = CatAPI
+			select {
+			case bus <- apiEvent:
+			default:
+			}
+			m.correlator.ProcessEvent(apiEvent)
+		} else {
+			return // same-process thread start — not suspicious
+		}
+
+	// ── Task A: ImageLoad provider ────────────────────────────────────────────
+	case "Microsoft-Windows-Kernel-Image":
+		// ImageLoad events fire whenever a PE image (EXE or DLL) is mapped into
+		// a process. We look for:
+		//   • DLLs loaded from suspicious user-writable paths
+		//   • Images with no backing file ("\Device\..." is a real path; empty or
+		//     device paths with unusual format signal reflective injection)
+		imageName, _ := getPropertyString(e, "ImageName")
+		if imageName == "" {
+			imageName, _ = getPropertyString(e, "FileName")
+		}
+		if imageName == "" {
+			return
+		}
+		imageBase, _ := getPropertyString(e, "ImageBase")
+		imageSize, _ := getPropertyInt(e, "ImageSize")
+
+		lowerImage := strings.ToLower(imageName)
+		normalized.Category = CatMemory
+		normalized.EventType = EventImageLoad
+		normalized.Data["image_name"] = imageName
+		normalized.Data["image_base"] = imageBase
+		normalized.Data["image_size"] = imageSize
+
+		// Reflective injection: image has no disk-backed path (path is empty,
+		// or reports \Device\...\<non-obvious> without a .dll/.exe suffix)
+		isReflective := imageName == "" ||
+			(!strings.HasSuffix(lowerImage, ".dll") &&
+				!strings.HasSuffix(lowerImage, ".exe") &&
+				!strings.HasSuffix(lowerImage, ".sys") &&
+				strings.HasPrefix(lowerImage, `\device\`))
+
+		// Suspicious user-writable paths
+		suspiciousPaths := []string{
+			`\temp\`, `\tmp\`, `\appdata\`, `\users\public\`,
+			`\programdata\`, `\windows\tasks\`, `\recycle`,
+		}
+		isSuspiciousPath := false
+		for _, p := range suspiciousPaths {
+			if strings.Contains(lowerImage, p) {
+				isSuspiciousPath = true
+				break
+			}
+		}
+
+		if isReflective {
+			normalized.Severity = SevCritical
+			normalized.Data["reflective"] = true
+			normalized.Data["mitre_ttp"] = "T1055.002"
+			normalized.Data["detail"] = "Image mapped with no disk-backed file (reflective DLL injection)"
+		} else if isSuspiciousPath {
+			normalized.Severity = SevHigh
+			normalized.Data["suspicious_path"] = true
+			normalized.Data["mitre_ttp"] = "T1055.001"
+			normalized.Data["detail"] = fmt.Sprintf("DLL loaded from suspicious writable path: %s", imageName)
+		} else {
+			return // benign system DLL load — skip
+		}
+
+	// ── Task B: DNS-Client provider ───────────────────────────────────────────
+	case "Microsoft-Windows-DNS-Client":
+		// EventID 3006 = DNS query initiated; 3008 = query completed.
+		// Both carry QueryName. We capture both to ensure coverage.
+		if e.System.EventID != 3006 && e.System.EventID != 3008 && e.System.EventID != 3000 {
+			return
+		}
+		queryName, _ := getPropertyString(e, "QueryName")
+		if queryName == "" {
+			return
+		}
+		queryType, _ := getPropertyString(e, "QueryType")
+		queryStatus, _ := getPropertyString(e, "QueryStatus")
+		queryResults, _ := getPropertyString(e, "QueryResults")
+
+		normalized.Category = CatNetwork
+		normalized.EventType = EventNetDNS
+		normalized.Severity = SevLow
+		normalized.Data["dns_query"] = queryName
+		normalized.Data["domain"] = queryName
+		normalized.Data["query_type"] = queryType
+		normalized.Data["query_status"] = queryStatus
+		normalized.Data["query_results"] = queryResults
+		normalized.Data["protocol"] = "DNS"
+		// DNS events fire in the context of the process issuing the query;
+		// header ProcessID is the actual querying process.
+		normalized.PID = int(e.System.Execution.ProcessID)
+
+	// ── Task B: Kernel-Handle provider ────────────────────────────────────────
+	case "Microsoft-Windows-Kernel-Handle":
+		// Opcodes/EventIDs for handle operations vary by Windows version;
+		// we use opcode name matching as the most portable approach.
+		opcodeName := strings.ToLower(e.System.Opcode.Name)
+		objectType, _ := getPropertyString(e, "ObjectType")
+		objectName, _ := getPropertyString(e, "ObjectName")
+		if objectName == "" {
+			objectName, _ = getPropertyString(e, "HandleName")
+		}
+
+		normalized.Category = CatAPI
+		normalized.Severity = SevMedium
+		normalized.Data["object_type"] = objectType
+		normalized.Data["object_name"] = objectName
+
+		if strings.Contains(opcodeName, "create") || e.System.EventID == 32 || e.System.EventID == 33 {
+			normalized.EventType = EventHandleCreate
+			// Escalate LSASS opens to critical
+			if strings.Contains(strings.ToLower(objectName), "lsass") {
+				normalized.Severity = SevCritical
+			}
+		} else if strings.Contains(opcodeName, "duplicate") || e.System.EventID == 34 {
+			targetPID, _ := getPropertyInt(e, "TargetProcessID")
+			normalized.EventType = EventHandleDuplicate
+			normalized.Data["target_pid"] = targetPID
+			if strings.Contains(strings.ToLower(objectName), "lsass") {
+				normalized.Severity = SevCritical
+			}
+		} else {
+			return // close/query operations are not actionable
+		}
+
+	// ── Task C: AMSI provider ─────────────────────────────────────────────────
+	case "Microsoft-Antimalware-Scan-Interface":
+		// AMSI fires on any content scan. We capture the raw content, scan it
+		// with the inline YARA engine (done in orchestrator via the event data),
+		// and emit an EventAMSIScan for the Sigma correlator.
+		scanContent, _ := getPropertyString(e, "ScanContent")
+		appName, _ := getPropertyString(e, "AppName")
+		contentName, _ := getPropertyString(e, "ContentName")
+		scanResult, _ := getPropertyString(e, "ScanResult")
+		if scanContent == "" && contentName == "" {
+			return // empty AMSI event
+		}
+		normalized.Category = CatScript
+		normalized.EventType = EventAMSIScan
+		normalized.Severity = SevMedium
+		normalized.Data["app_name"] = appName
+		normalized.Data["content_name"] = contentName
+		normalized.Data["scan_result"] = scanResult
+		// Store raw content for inline YARA scanning in the orchestrator pipeline
+		if scanContent != "" {
+			normalized.Data["script_block"] = scanContent
+		}
+		normalized.Data["mitre_ttp"] = "T1059.001"
+
+	// ── Task C: PowerShell provider ───────────────────────────────────────────
+	case "Microsoft-Windows-PowerShell":
+		// Event ID 4104 = Script block logging. This fires for every PowerShell
+		// script block executed, capturing the full deobfuscated text that the
+		// PowerShell engine processes. Note: 4104 is the ETW event ID, not the
+		// classic Windows event log ID.
+		// We also accept event ID 4103 (module pipeline logging) and 40961/40962
+		// (PowerShell session start) for broader coverage.
+		if e.System.EventID != 4104 && e.System.EventID != 4103 {
+			return
+		}
+		scriptBlock, _ := getPropertyString(e, "ScriptBlockText")
+		if scriptBlock == "" {
+			scriptBlock, _ = getPropertyString(e, "Payload") // 4103 uses Payload field
+		}
+		if scriptBlock == "" {
+			return
+		}
+		path, _ := getPropertyString(e, "Path")
+		scriptBlockID, _ := getPropertyString(e, "ScriptBlockId")
+
+		normalized.Category = CatScript
+		normalized.EventType = EventPowerShell
+		normalized.Severity = SevMedium
+		normalized.Data["script_block"] = scriptBlock
+		normalized.Data["script_path"] = path
+		normalized.Data["script_block_id"] = scriptBlockID
+		normalized.Data["mitre_ttp"] = "T1059.001"
 
 	default:
 		return

@@ -17,6 +17,13 @@ type CorrelationEngine struct {
 	netConns     map[int][]string          // PID -> dest IP/domain
 	apiCalls     map[int][]string          // PID -> API calls made
 	injectionMap map[int]map[int]bool      // Source PID -> Target PID -> Injecting actions
+	// Task A additions
+	dllLoads     map[int][]string          // PID -> DLL image paths loaded (Task A)
+	// Task B additions
+	dnsQueries   map[int][]string          // PID -> DNS query names (Task B)
+	handleAccess map[int][]string          // PID -> object names accessed (Task B)
+	// Task C additions
+	scriptBlocks map[int][]string          // PID -> PS script block snippets (Task C)
 	alerts       chan<- Event
 }
 
@@ -39,6 +46,10 @@ func NewCorrelationEngine(jobID string, alerts chan<- Event) *CorrelationEngine 
 		netConns:     make(map[int][]string),
 		apiCalls:     make(map[int][]string),
 		injectionMap: make(map[int]map[int]bool),
+		dllLoads:     make(map[int][]string),
+		dnsQueries:   make(map[int][]string),
+		handleAccess: make(map[int][]string),
+		scriptBlocks: make(map[int][]string),
 		alerts:       alerts,
 	}
 }
@@ -130,6 +141,65 @@ func (ce *CorrelationEngine) ProcessEvent(ev Event) {
 		if apiName != "" {
 			ce.apiCalls[ev.PID] = append(ce.apiCalls[ev.PID], apiName)
 			ce.checkProcessInjection(ev.PID, apiName, ev.Data, ev.Timestamp)
+		}
+
+	// ── Task A: DLL/Image load tracking ──────────────────────────────────────
+	case EventImageLoad:
+		imageName, _ := ev.Data["image_name"].(string)
+		if imageName != "" {
+			ce.dllLoads[ev.PID] = append(ce.dllLoads[ev.PID], imageName)
+		}
+		isReflective, _ := ev.Data["reflective"].(bool)
+		if isReflective {
+			ce.checkReflectiveInjection(ev.PID, imageName, ev.Timestamp)
+		}
+
+	// ── Task A: Thread creation (cross-process) ───────────────────────────────
+	case EventThreadCreate:
+		// The APICall echo is already emitted in monitor_windows.go; however we
+		// also record it here for completeness and future chained correlation.
+		targetPID, _ := ev.Data["target_pid"].(int)
+		if targetPID == 0 {
+			if tf, ok := ev.Data["target_pid"].(float64); ok {
+				targetPID = int(tf)
+			}
+		}
+		if targetPID != 0 && targetPID != ev.PID {
+			ce.checkProcessInjection(ev.PID, "CreateRemoteThread", ev.Data, ev.Timestamp)
+		}
+
+	// ── Task B: DNS query tracking ────────────────────────────────────────────
+	case EventNetDNS:
+		query, _ := ev.Data["dns_query"].(string)
+		if query == "" {
+			query, _ = ev.Data["domain"].(string)
+		}
+		if query != "" {
+			ce.dnsQueries[ev.PID] = append(ce.dnsQueries[ev.PID], query)
+			// Store domain in netConns so existing checkC2Aftermath() fires
+			ce.netConns[ev.PID] = append(ce.netConns[ev.PID], query)
+			ce.checkC2Aftermath(ev.PID, query, ev.Timestamp)
+		}
+
+	// ── Task B: Handle access tracking ───────────────────────────────────────
+	case EventHandleCreate, EventHandleDuplicate:
+		objectName, _ := ev.Data["object_name"].(string)
+		objectType, _ := ev.Data["object_type"].(string)
+		if objectName != "" {
+			ce.handleAccess[ev.PID] = append(ce.handleAccess[ev.PID], objectName)
+		}
+		ce.checkLSASSAccess(ev.PID, objectType, objectName, ev.Timestamp)
+
+	// ── Task C: PowerShell / AMSI script block tracking ───────────────────────
+	case EventPowerShell, EventAMSIScan:
+		script, _ := ev.Data["script_block"].(string)
+		if script != "" {
+			// Store a short prefix only (avoid memory bloat from huge blocks)
+			prefix := script
+			if len(prefix) > 256 {
+				prefix = prefix[:256]
+			}
+			ce.scriptBlocks[ev.PID] = append(ce.scriptBlocks[ev.PID], prefix)
 		}
 	}
 }
@@ -281,6 +351,29 @@ func (ce *CorrelationEngine) checkC2Aftermath(pid int, dest string, t time.Time)
 				pid, dest, item),
 			SevCritical, t)
 	}
+}
+
+// checkReflectiveInjection alerts when a PE image is mapped into a process
+// without a disk-backed file, which is the hallmark of reflective DLL injection.
+// Mapped to MITRE T1055.002.
+func (ce *CorrelationEngine) checkReflectiveInjection(pid int, imageName string, t time.Time) {
+	ce.emitAlert(pid, "T1055.002", "Reflective DLL Injection Detected",
+		fmt.Sprintf("Process (%d) loaded an image '%s' with no disk-backed file — reflective injection pattern",
+			pid, imageName),
+		SevCritical, t)
+}
+
+// checkLSASSAccess alerts when a process opens or duplicates a handle to lsass.exe.
+// This is a necessary prerequisite for credential dumping tools such as Mimikatz.
+// Mapped to MITRE T1003.001.
+func (ce *CorrelationEngine) checkLSASSAccess(pid int, objectType, objectName string, t time.Time) {
+	if !strings.Contains(strings.ToLower(objectName), "lsass") {
+		return
+	}
+	ce.emitAlert(pid, "T1003.001", "LSASS Handle Access Detected",
+		fmt.Sprintf("Process (%d) opened a '%s' handle to '%s' — potential credential dumping precursor",
+			pid, objectType, objectName),
+		SevCritical, t)
 }
 
 func (ce *CorrelationEngine) emitAlert(pid int, ttp string, technique string, details string, severity int, t time.Time) {
