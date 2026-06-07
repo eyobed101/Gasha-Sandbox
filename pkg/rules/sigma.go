@@ -102,7 +102,7 @@ func (s *SigmaCorrelator) Evaluate(ev monitor.Event) []RuleHit {
 			domain = query
 		}
 
-		// DGA detection heuristic: high-entropy hostname label
+		// DGA detection — uses full bigram + consonant + length model
 		if isDGADomain(domain) {
 			hits = append(hits, RuleHit{
 				RuleName:    "DGADomainDetected",
@@ -287,65 +287,8 @@ func (s *SigmaCorrelator) Evaluate(ev monitor.Event) []RuleHit {
 	return hits
 }
 
-// isDGADomain returns true if the domain exhibits DGA characteristics:
-//   - host label length > 15, OR
-//   - host label Shannon entropy > 3.5 bits
+// isDGADomain delegates to the statistical DGA detector in the monitor package.
+// Uses bigram frequency + consonant-cluster ratio + label length.
 func isDGADomain(domain string) bool {
-	if domain == "" {
-		return false
-	}
-	labels := strings.Split(domain, ".")
-	if len(labels) < 2 {
-		return false
-	}
-
-	hostLabel := labels[0]
-	if len(hostLabel) < 8 {
-		return false
-	}
-	if len(hostLabel) > 15 {
-		return true
-	}
-
-	// Compute Shannon entropy of the host label
-	freq := make(map[rune]int)
-	for _, c := range hostLabel {
-		freq[c]++
-	}
-	n := float64(len(hostLabel))
-	entropy := 0.0
-	for _, count := range freq {
-		p := float64(count) / n
-		if p > 0 {
-			entropy -= p * log2(p)
-		}
-	}
-	return entropy > 3.5
-}
-
-// log2 computes log base-2 without importing math (avoids import cycle; math is already
-// used in yara.go in the same package, so both files compile together fine).
-func log2(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	// Iterative natural log via Taylor series, then divide by ln(2)
-	result := lnIter(x)
-	return result / 0.6931471805599453
-}
-
-// lnIter approximates ln(x) using the identity ln(x) = 2*atanh((x-1)/(x+1)).
-func lnIter(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	y := (x - 1) / (x + 1)
-	y2 := y * y
-	sum := 0.0
-	term := y
-	for i := 0; i < 40; i++ {
-		sum += term / float64(2*i+1)
-		term *= y2
-	}
-	return 2 * sum
+	return monitor.IsDGADomainV2(domain)
 }

@@ -214,8 +214,21 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 	close(publishChan)
 	bus.StopPipeline()
 
-	// --- STEP 6: Post-execution memory scan (simulated for non-zero exit) ---
-	if job.Status == "timeout" || exitCode != 0 {
+	// --- STEP 6: Post-execution memory inspection ---
+	// Run a full VirtualQuery walk + PE reconstruction + module diff on the
+	// analysis process.  Results feed directly into the YARA scan pipeline.
+	memFindings := monitor.InspectProcess(job.ID, proc.PID(), publishChan)
+	for _, f := range memFindings {
+		// Re-scan each dumped region content through YARA if it contains a PE
+		if f.FindingID == "UnbackedPE" || f.FindingID == "HiddenModule" {
+			memHits := o.rules.ScanMemory(proc.PID(), f.Address, []byte{0x4D, 0x5A}) // MZ sentinel
+			ruleHitsMu.Lock()
+			allHits = append(allHits, memHits...)
+			ruleHitsMu.Unlock()
+		}
+	}
+	// Fall back to legacy stub scan on timeout/non-zero exit for coverage
+	if (job.Status == "timeout" || exitCode != 0) && len(memFindings) == 0 {
 		memHits := o.rules.ScanMemory(proc.PID(), "0x00400000", []byte("MZ header in unbacked memory... mimikatz"))
 		ruleHitsMu.Lock()
 		allHits = append(allHits, memHits...)
