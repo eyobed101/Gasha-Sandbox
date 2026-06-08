@@ -1,32 +1,45 @@
 # LEMAS Configuration File
-# Policy and agent-wide runtime options
+# All values here are used directly by the engine — no hardcoded defaults remain.
+# CLI flags override these values when explicitly provided.
+# Environment variables take highest priority:
+#   LEMAS_API_KEY        — REST API authentication key
+#   LEMAS_LISTEN_ADDR    — override api.listen_addr
+#   LEMAS_DB_PATH        — override analysis.storage_path
+#   LEMAS_REPORTS_DIR    — override analysis.reports_dir
+#   LEMAS_RULES_DIR      — override analysis.rules_dir
+#   LEMAS_BPF_OBJECT     — path to compiled monitoring.bpf.o (Linux eBPF)
 
 analysis:
-  default_timeout_seconds: 120
-  max_timeout_seconds: 300
-  storage_path: "./lemas.db"
-  reports_dir: "./reports"
-  memory_dumps_dir: "./reports/dumps"
-  rules_dir: "./rules"
+  default_timeout_seconds: 120   # per-job analysis timeout
+  max_timeout_seconds: 300       # hard ceiling — enforced even for DLL profiles
+  storage_path: "./lemas.db"     # SQLite database path
+  reports_dir: "./reports"       # output directory for JSON + HTML reports
+  memory_dumps_dir: "./reports/dumps"  # suspicious memory region dumps
+  rules_dir: "./rules"           # root of YARA + Sigma rule directories
 
 isolation:
-  # Isolation provider: 'job_object' (Windows), 'namespace' (Linux), or 'none' / 'mock' (fallback)
+  # provider: 'job_object' (Windows), 'namespace' (Linux), 'none' (testing)
   provider: "job_object"
-  cpu_limit_percent: 25        # Restrict process tree to 25% of a CPU core
-  memory_limit_mb: 200         # Hard memory budget for execution tree
-  max_processes: 10            # Stop fork-bombs
+  cpu_limit_percent: 25          # hard CPU cap for the entire process tree
+  memory_limit_mb: 200           # hard memory cap per-job (MB)
+  max_processes: 10              # fork-bomb protection
 
 network:
-  # Network containment level: 'deny_all', 'loopback_only', or 'monitored_egress' (MITM proxy)
+  # containment: 'deny_all' | 'loopback_only' | 'monitored_egress'
   containment: "loopback_only"
   dns_server: "8.8.8.8"
-  pcap_enabled: true
-  pcap_max_size_mb: 100
+  pcap_enabled: true             # write capture.pcap to each job's report dir
+  pcap_max_size_mb: 100          # rolling cap — stops writing at this size
 
 rules:
   yara:
     enabled: true
-    fast_scan: true
+    fast_scan: true              # skip large binaries > 50 MB
   sigma:
     enabled: true
-    batch_window_ms: 100
+    batch_window_ms: 100         # event batching window for correlation chains
+
+api:
+  listen_addr: ":8080"           # address the REST daemon binds to
+  api_key: ""                    # set here or via LEMAS_API_KEY env var
+  rate_limit_per_min: 30         # max requests per IP per minute

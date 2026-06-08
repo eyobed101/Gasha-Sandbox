@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/httprate"
+	"github.com/lemas-sandbox/lemas/pkg/config"
 	"github.com/lemas-sandbox/lemas/pkg/logger"
 	"github.com/lemas-sandbox/lemas/pkg/middleware"
 	"github.com/lemas-sandbox/lemas/pkg/orchestrator"
@@ -19,18 +20,13 @@ var log = logger.ForComponent("api")
 
 // APIServer exposes the LEMAS analysis pipeline over HTTP.
 type APIServer struct {
-	orch       *orchestrator.Orchestrator
-	reportsDir string
-	apiKey     string // empty = auth disabled
+	orch *orchestrator.Orchestrator
+	cfg  *config.Config
 }
 
-// NewAPIServer creates the server. apiKey is read from config/env by the caller.
-func NewAPIServer(orch *orchestrator.Orchestrator, reportsDir, apiKey string) *APIServer {
-	return &APIServer{
-		orch:       orch,
-		reportsDir: reportsDir,
-		apiKey:     apiKey,
-	}
+// NewAPIServer creates the server from a fully loaded config.
+func NewAPIServer(orch *orchestrator.Orchestrator, cfg *config.Config) *APIServer {
+	return &APIServer{orch: orch, cfg: cfg}
 }
 
 // Start registers routes and begins serving. Blocks until the listener errors.
@@ -41,22 +37,25 @@ func (s *APIServer) Start(addr string) error {
 	mux.HandleFunc("/report/", s.handleReport)
 	mux.HandleFunc("/health", s.handleHealth)
 
-	// Middleware stack (outermost = first executed):
-	//   1. Request logger
-	//   2. Rate limiter  — 30 requests / minute per IP
-	//   3. API key auth
-	//   4. Content-type guard
+	rateLimit := s.cfg.API.RateLimitPerMin
+	if rateLimit <= 0 {
+		rateLimit = 30
+	}
+
 	var handler http.Handler = mux
 	handler = middleware.ContentTypeJSON(handler)
-	handler = middleware.APIKeyAuth(s.apiKey)(handler)
-	handler = httprate.LimitByIP(30, time.Minute)(handler)
+	handler = middleware.APIKeyAuth(s.cfg.API.APIKey)(handler)
+	handler = httprate.LimitByIP(rateLimit, time.Minute)(handler)
 	handler = middleware.RequestLogger(handler)
 
-	log.Info().Str("addr", addr).Msg("LEMAS REST API listening")
+	log.Info().
+		Str("addr", addr).
+		Int("rate_limit_per_min", rateLimit).
+		Bool("auth_enabled", s.cfg.API.APIKey != "").
+		Msg("LEMAS REST API listening")
 	return http.ListenAndServe(addr, handler)
 }
 
-// handleHealth is an unauthenticated liveness probe endpoint.
 func (s *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -75,13 +74,11 @@ func (s *APIServer) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		defer file.Close()
 
-		// Sanitise the filename to prevent path traversal.
 		safeName := filepath.Base(header.Filename)
 		if safeName == "." || safeName == "/" {
 			jsonError(w, "invalid filename", http.StatusBadRequest)
 			return
 		}
-
 		if err := os.MkdirAll("./temp_uploads", 0755); err != nil {
 			jsonError(w, "server error", http.StatusInternalServerError)
 			return
@@ -95,7 +92,6 @@ func (s *APIServer) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer tmp.Close()
-
 		if _, err := io.Copy(tmp, file); err != nil {
 			jsonError(w, "failed to write upload: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -119,8 +115,6 @@ func (s *APIServer) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Temp file cleanup: schedule removal after a short delay so the orchestrator
-	// has time to open the file before we delete it.
 	if cleanupTemp {
 		go func() {
 			time.Sleep(5 * time.Second)
@@ -143,22 +137,16 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "missing job_id", http.StatusBadRequest)
 		return
 	}
-
 	status, err := s.orch.GetJobStatus(jobID)
 	if err != nil {
 		jsonError(w, "job not found", http.StatusNotFound)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"job_id": jobID,
-		"status": status,
-	})
+	json.NewEncoder(w).Encode(map[string]string{"job_id": jobID, "status": status})
 }
 
 func (s *APIServer) handleReport(w http.ResponseWriter, r *http.Request) {
-	// /report/{id}/{json|html}
 	jobID := extractPathSegment(r.URL.Path, 2)
 	format := extractPathSegment(r.URL.Path, 3)
 	if jobID == "" || format == "" {
@@ -166,16 +154,14 @@ func (s *APIServer) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var (
-		reportPath  string
-		contentType string
-	)
+	reportsDir := s.cfg.Analysis.ReportsDir
+	var reportPath, contentType string
 	switch format {
 	case "json":
-		reportPath = filepath.Join(s.reportsDir, jobID, "report.json")
+		reportPath = filepath.Join(reportsDir, jobID, "report.json")
 		contentType = "application/json"
 	case "html":
-		reportPath = filepath.Join(s.reportsDir, jobID, "report.html")
+		reportPath = filepath.Join(reportsDir, jobID, "report.html")
 		contentType = "text/html; charset=utf-8"
 	default:
 		jsonError(w, "unsupported format: use json or html", http.StatusBadRequest)
@@ -187,7 +173,6 @@ func (s *APIServer) handleReport(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "report not found or still generating", http.StatusNotFound)
 		return
 	}
-
 	w.Header().Set("Content-Type", contentType)
 	w.Write(data)
 }
@@ -200,8 +185,6 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// extractPathSegment splits a URL path by "/" and returns the element at index i.
-// Index 0 is always "", index 1 is the first path component, etc.
 func extractPathSegment(path string, index int) string {
 	parts := strings.Split(path, "/")
 	if index >= len(parts) {

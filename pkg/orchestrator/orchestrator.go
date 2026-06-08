@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lemas-sandbox/lemas/pkg/capture"
+	"github.com/lemas-sandbox/lemas/pkg/config"
 	"github.com/lemas-sandbox/lemas/pkg/isolation"
 	"github.com/lemas-sandbox/lemas/pkg/logger"
 	"github.com/lemas-sandbox/lemas/pkg/monitor"
@@ -24,31 +25,33 @@ import (
 var log = logger.ForComponent("orchestrator")
 
 type Orchestrator struct {
-	store      *storage.Store
-	rules      *rules.Engine
-	iso        isolation.Provider
-	queue      *JobQueue
-	reportsDir string
+	store *storage.Store
+	rules *rules.Engine
+	iso   isolation.Provider
+	queue *JobQueue
+	cfg   *config.Config
 }
 
-func NewOrchestrator(dbPath, reportsDir, rulesDir string) (*Orchestrator, error) {
-	store, err := storage.NewStore(dbPath)
+// NewOrchestrator creates an orchestrator driven entirely by cfg.
+// All paths, limits, and timeouts come from the config — no hardcoded values.
+func NewOrchestrator(cfg *config.Config) (*Orchestrator, error) {
+	store, err := storage.NewStore(cfg.Analysis.StoragePath)
 	if err != nil {
 		return nil, err
 	}
 
-	ruleEng, err := rules.NewEngine(rulesDir)
+	ruleEng, err := rules.NewEngine(cfg.Analysis.RulesDir)
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
 
 	return &Orchestrator{
-		store:      store,
-		rules:      ruleEng,
-		iso:        isolation.NewProvider(),
-		queue:      NewJobQueue(),
-		reportsDir: reportsDir,
+		store: store,
+		rules: ruleEng,
+		iso:   isolation.NewProvider(),
+		queue: NewJobQueue(),
+		cfg:   cfg,
 	}, nil
 }
 
@@ -112,10 +115,20 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 	o.store.SaveJob(*job)
 
 	profile := GetProfileForFile(job.FilePath)
-	jlog.Info().Str("file", job.FilePath).Str("type", job.FileType).Msg("job started")
+	// Override profile timeout from config if the profile default is shorter
+	if o.cfg.Analysis.DefaultTimeoutSeconds > 0 && profile.TimeoutSec == 0 {
+		profile.TimeoutSec = o.cfg.Analysis.DefaultTimeoutSeconds
+	}
 
-	outJSON := filepath.Join(o.reportsDir, job.ID, "report.json")
-	outHTML := filepath.Join(o.reportsDir, job.ID, "report.html")
+	jlog.Info().
+		Str("file", job.FilePath).
+		Str("type", job.FileType).
+		Int("timeout_sec", profile.TimeoutSec).
+		Msg("job started")
+
+	reportsDir := o.cfg.Analysis.ReportsDir
+	outJSON := filepath.Join(reportsDir, job.ID, "report.json")
+	outHTML := filepath.Join(reportsDir, job.ID, "report.html")
 
 	// --- STEP 1: Static scan ---
 	hits := o.rules.ScanFile(job.FilePath)
@@ -134,11 +147,15 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 		}
 	}()
 
-	// --- STEP 2b: PCAP writer (non-fatal if init fails) ---
-	pcapWriter, pcapErr := capture.NewWriter(job.ID, o.reportsDir, 100)
-	if pcapErr != nil {
-		jlog.Warn().Err(pcapErr).Msg("pcap capture disabled for this job")
-		pcapWriter = nil
+	// --- STEP 2b: PCAP writer — driven by config ---
+	var pcapWriter *capture.PCAPWriter
+	if o.cfg.Network.PCAPEnabled {
+		w, pcapErr := capture.NewWriter(job.ID, reportsDir, o.cfg.Network.PCAPMaxSizeMB)
+		if pcapErr != nil {
+			jlog.Warn().Err(pcapErr).Msg("pcap capture disabled for this job")
+		} else {
+			pcapWriter = w
+		}
 	}
 
 	var ruleHitsMu sync.Mutex
@@ -147,14 +164,18 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 	go func() {
 		for ev := range consumerChan {
 			o.store.SaveEvent(ev)
-			sigmaHits := o.rules.ProcessEvent(ctx, ev)
-			if len(sigmaHits) > 0 {
-				ruleHitsMu.Lock()
-				allHits = append(allHits, sigmaHits...)
-				ruleHitsMu.Unlock()
+
+			// Sigma correlation (gated by config)
+			if o.cfg.Rules.Sigma.Enabled {
+				sigmaHits := o.rules.ProcessEvent(ctx, ev)
+				if len(sigmaHits) > 0 {
+					ruleHitsMu.Lock()
+					allHits = append(allHits, sigmaHits...)
+					ruleHitsMu.Unlock()
+				}
 			}
 
-			// Write synthetic PCAP packet for network events
+			// PCAP — synthetic TCP frames for network events
 			if pcapWriter != nil && (ev.EventType == monitor.EventNetConnect || ev.EventType == monitor.EventNetDNS) {
 				srcIP, _ := ev.Data["SourceIp"].(string)
 				dstIP, _ := ev.Data["DestinationIp"].(string)
@@ -168,26 +189,28 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 				}
 			}
 
-			// Task C: inline YARA scan for PowerShell script blocks and AMSI content
-			if ev.EventType == monitor.EventPowerShell || ev.EventType == monitor.EventAMSIScan {
-				if scriptBlock, ok := ev.Data["script_block"].(string); ok && len(scriptBlock) > 0 {
-					sourcePath := fmt.Sprintf("%s:PID-%d", ev.EventType, ev.PID)
-					scriptHits := o.rules.ScanScript([]byte(scriptBlock), sourcePath)
-					if len(scriptHits) > 0 {
-						ruleHitsMu.Lock()
-						allHits = append(allHits, scriptHits...)
-						ruleHitsMu.Unlock()
+			// Inline YARA on PowerShell / AMSI content (gated by config)
+			if o.cfg.Rules.YARA.Enabled {
+				if ev.EventType == monitor.EventPowerShell || ev.EventType == monitor.EventAMSIScan {
+					if scriptBlock, ok := ev.Data["script_block"].(string); ok && len(scriptBlock) > 0 {
+						sourcePath := fmt.Sprintf("%s:PID-%d", ev.EventType, ev.PID)
+						scriptHits := o.rules.ScanScript([]byte(scriptBlock), sourcePath)
+						if len(scriptHits) > 0 {
+							ruleHitsMu.Lock()
+							allHits = append(allHits, scriptHits...)
+							ruleHitsMu.Unlock()
+						}
 					}
 				}
 			}
 		}
 	}()
 
-	// --- STEP 3: Launch process inside isolation layer ---
+	// --- STEP 3: Launch process inside isolation layer (limits from config) ---
 	limits := isolation.Limits{
-		CPULimitPercent: 25,
-		MemoryLimitMB:   200,
-		MaxProcesses:    10,
+		CPULimitPercent: o.cfg.Isolation.CPULimitPercent,
+		MemoryLimitMB:   int64(o.cfg.Isolation.MemoryLimitMB),
+		MaxProcesses:    o.cfg.Isolation.MaxProcesses,
 	}
 
 	analysisTimeout := time.Duration(profile.TimeoutSec) * time.Second
@@ -197,14 +220,7 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 	proc, err := o.iso.CreateProcess(runCtx, profile.LaunchPath, profile.LaunchArgs, filepath.Dir(job.FilePath), limits)
 	if err != nil {
 		jlog.Error().Err(err).Msg("failed to create isolated process")
-		job.CompletedAt = time.Now()
-		job.Status = "failed"
-		o.store.SaveJob(*job)
-		close(publishChan)
-		bus.StopPipeline()
-		if pcapWriter != nil {
-			pcapWriter.Close()
-		}
+		o.failJob(job, publishChan, bus, pcapWriter)
 		return
 	}
 
@@ -213,14 +229,7 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 	if err := mon.Start(runCtx, job.ID, proc.PID(), publishChan); err != nil {
 		jlog.Error().Err(err).Msg("telemetry monitor failed to start")
 		proc.Kill()
-		job.CompletedAt = time.Now()
-		job.Status = "failed"
-		o.store.SaveJob(*job)
-		close(publishChan)
-		bus.StopPipeline()
-		if pcapWriter != nil {
-			pcapWriter.Close()
-		}
+		o.failJob(job, publishChan, bus, pcapWriter)
 		return
 	}
 
@@ -248,7 +257,10 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 
 	if pcapWriter != nil {
 		pcapWriter.Close()
-		jlog.Info().Str("pcap", pcapWriter.Path()).Int64("bytes", pcapWriter.Written()).Msg("network capture saved")
+		jlog.Info().
+			Str("pcap", pcapWriter.Path()).
+			Int64("bytes", pcapWriter.Written()).
+			Msg("network capture saved")
 	}
 
 	// --- STEP 6: Post-execution memory inspection ---
@@ -268,10 +280,28 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 		ruleHitsMu.Unlock()
 	}
 
-	jlog.Info().Str("status", job.Status).Int("rule_hits", len(allHits)).Msg("job finished")
+	job.CompletedAt = time.Now()
+	o.store.SaveJob(*job)
+
+	jlog.Info().
+		Str("status", job.Status).
+		Int("rule_hits", len(allHits)).
+		Msg("job finished")
 
 	// --- STEP 7: Generate reports ---
 	report.GenerateReport(job.ID, o.store, allHits, outJSON, outHTML)
+}
+
+// failJob marks a job as failed, drains and stops all pipeline components.
+func (o *Orchestrator) failJob(job *storage.Job, publishChan chan monitor.Event, bus *monitor.InstrumentationBus, pcapWriter *capture.PCAPWriter) {
+	job.CompletedAt = time.Now()
+	job.Status = "failed"
+	o.store.SaveJob(*job)
+	close(publishChan)
+	bus.StopPipeline()
+	if pcapWriter != nil {
+		pcapWriter.Close()
+	}
 }
 
 func analyzeFileStatic(path string) (string, string, error) {
