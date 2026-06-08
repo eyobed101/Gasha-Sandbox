@@ -26,7 +26,80 @@ func (s *SigmaCorrelator) Evaluate(ev monitor.Event) []RuleHit {
 	var hits []RuleHit
 
 	switch ev.EventType {
-	case monitor.EventAPICall:
+	case monitor.EventProcessCreate:
+		image, _ := ev.Data["Image"].(string)
+		cmdline, _ := ev.Data["CommandLine"].(string)
+		parentImage, _ := ev.Data["ParentImage"].(string)
+		lowerImg := strings.ToLower(image)
+		lowerCmd := strings.ToLower(cmdline)
+		lowerParent := strings.ToLower(parentImage)
+		baseName := lowerImg
+		if idx := strings.LastIndexAny(lowerImg, `/\`); idx >= 0 {
+			baseName = lowerImg[idx+1:]
+		}
+
+		// T1053.005 — schtasks.exe /create
+		if baseName == "schtasks.exe" && strings.Contains(lowerCmd, "/create") {
+			hits = append(hits, RuleHit{
+				RuleName:    "ScheduledTaskCreatedViaCLI",
+				Engine:      "sigma",
+				Description: "schtasks.exe invoked with /create — scheduled task persistence via command line.",
+				Severity:    "high",
+				MITRETTP:    "T1053.005",
+				MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+				Evidence:    fmt.Sprintf("Image: %s, CommandLine: %s", image, cmdline),
+			})
+		}
+
+		// T1543.003 — sc.exe create / config
+		if baseName == "sc.exe" &&
+			(strings.Contains(lowerCmd, " create ") || strings.Contains(lowerCmd, " config ")) {
+			hits = append(hits, RuleHit{
+				RuleName:    "ServiceCreatedViaSC",
+				Engine:      "sigma",
+				Description: "sc.exe used to create or configure a Windows service — common malware persistence technique.",
+				Severity:    "high",
+				MITRETTP:    "T1543.003",
+				MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+				Evidence:    fmt.Sprintf("CommandLine: %s", cmdline),
+			})
+		}
+
+		// T1047 — wmic.exe process call create
+		if baseName == "wmic.exe" && strings.Contains(lowerCmd, "process") &&
+			strings.Contains(lowerCmd, "call create") {
+			hits = append(hits, RuleHit{
+				RuleName:    "WMICProcessCreate",
+				Engine:      "sigma",
+				Description: "wmic.exe used to spawn a process — common fileless execution and lateral movement vector.",
+				Severity:    "high",
+				MITRETTP:    "T1047",
+				MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+				Evidence:    fmt.Sprintf("CommandLine: %s", cmdline),
+			})
+		}
+
+		// T1059.001 — powershell spawned by non-interactive parent
+		suspiciousParents := []string{"winword.exe", "excel.exe", "outlook.exe",
+			"mshta.exe", "wscript.exe", "cscript.exe", "regsvr32.exe", "rundll32.exe"}
+		if baseName == "powershell.exe" || baseName == "pwsh.exe" {
+			for _, sp := range suspiciousParents {
+				if strings.HasSuffix(lowerParent, sp) {
+					hits = append(hits, RuleHit{
+						RuleName:    "PowerShellFromSuspiciousParent",
+						Engine:      "sigma",
+						Description: "PowerShell spawned from a suspicious parent process — common macro/script dropper pattern.",
+						Severity:    "critical",
+						MITRETTP:    "T1059.001",
+						MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+						Evidence:    fmt.Sprintf("Parent: %s, CommandLine: %s", parentImage, cmdline),
+					})
+					break
+				}
+			}
+		}
+
+	
 		apiName, _ := ev.Data["api_name"].(string)
 		args, _ := ev.Data["args"].(map[string]interface{})
 
@@ -267,7 +340,6 @@ func (s *SigmaCorrelator) Evaluate(ev monitor.Event) []RuleHit {
 		details, _ := ev.Data["details"].(string)
 		mitre, _ := ev.Data["mitre_ttp"].(string)
 
-		// T1497 - Evasion Detected
 		hits = append(hits, RuleHit{
 			RuleName:    "AntiAnalysisEvasionAttempted",
 			Engine:      "sigma",
@@ -277,6 +349,147 @@ func (s *SigmaCorrelator) Evaluate(ev monitor.Event) []RuleHit {
 			MatchedOn:   tech,
 			Evidence:    details,
 		})
+
+	// ── Tier 1: WMI Activity ─────────────────────────────────────────────────
+	case monitor.EventWMI:
+		op, _ := ev.Data["wmi_operation"].(string)
+		consumer, _ := ev.Data["wmi_consumer"].(string)
+		query, _ := ev.Data["wmi_query"].(string)
+		method, _ := ev.Data["wmi_method"].(string)
+		subType, _ := ev.Data["subscription_type"].(string)
+		namespace, _ := ev.Data["wmi_namespace"].(string)
+
+		switch op {
+		case "EventSubscription":
+			hits = append(hits, RuleHit{
+				RuleName:    "WMIEventSubscriptionPersistence",
+				Engine:      "sigma",
+				Description: "WMI event subscription created — a fileless persistence mechanism commonly used by APTs and commodity malware.",
+				Severity:    "critical",
+				MITRETTP:    "T1547.003",
+				MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+				Evidence:    fmt.Sprintf("Type: %s, Namespace: %s, Consumer: %s, Query: %s", subType, namespace, consumer, query),
+			})
+		case "MethodExecution":
+			// Win32_Process.Create via WMI is a classic execution bypass
+			if strings.Contains(strings.ToLower(method), "process") ||
+				strings.Contains(strings.ToLower(method), "create") {
+				hits = append(hits, RuleHit{
+					RuleName:    "WMIProcessExecution",
+					Engine:      "sigma",
+					Description: "WMI used to create or execute a process — common lateral movement and execution technique.",
+					Severity:    "high",
+					MITRETTP:    "T1047",
+					MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+					Evidence:    fmt.Sprintf("Method: %s, Namespace: %s", method, namespace),
+				})
+			} else {
+				hits = append(hits, RuleHit{
+					RuleName:    "WMIMethodExecution",
+					Engine:      "sigma",
+					Description: "WMI method execution detected — potential living-off-the-land technique.",
+					Severity:    "medium",
+					MITRETTP:    "T1047",
+					MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+					Evidence:    fmt.Sprintf("Method: %s, Namespace: %s", method, namespace),
+				})
+			}
+		}
+
+	// ── Tier 1: Scheduled Task ───────────────────────────────────────────────
+	case monitor.EventSchedTask:
+		op, _ := ev.Data["task_operation"].(string)
+		taskName, _ := ev.Data["task_name"].(string)
+		userCtx, _ := ev.Data["user_context"].(string)
+		action, _ := ev.Data["action_name"].(string)
+
+		switch op {
+		case "Registered":
+			hits = append(hits, RuleHit{
+				RuleName:    "ScheduledTaskCreated",
+				Engine:      "sigma",
+				Description: "A new scheduled task was registered — frequently used for persistence and privilege escalation.",
+				Severity:    "high",
+				MITRETTP:    "T1053.005",
+				MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+				Evidence:    fmt.Sprintf("Task: %s, UserContext: %s", taskName, userCtx),
+			})
+			// Escalate if task runs as SYSTEM
+			if strings.Contains(strings.ToLower(userCtx), "system") ||
+				strings.Contains(strings.ToLower(userCtx), "nt authority") {
+				hits = append(hits, RuleHit{
+					RuleName:    "ScheduledTaskAsSystem",
+					Engine:      "sigma",
+					Description: "Scheduled task registered to run as SYSTEM — high-privilege persistence.",
+					Severity:    "critical",
+					MITRETTP:    "T1053.005",
+					MatchedOn:   fmt.Sprintf("PID %d Task: %s", ev.PID, taskName),
+					Evidence:    fmt.Sprintf("UserContext: %s", userCtx),
+				})
+			}
+		case "Updated":
+			hits = append(hits, RuleHit{
+				RuleName:    "ScheduledTaskModified",
+				Engine:      "sigma",
+				Description: "Existing scheduled task was modified — possible hijacking of a legitimate task for persistence.",
+				Severity:    "high",
+				MITRETTP:    "T1053.005",
+				MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+				Evidence:    fmt.Sprintf("Task: %s, UserContext: %s", taskName, userCtx),
+			})
+		case "ActionStarted":
+			// Only flag if task name looks suspicious (not Windows built-ins)
+			lower := strings.ToLower(taskName)
+			if !strings.HasPrefix(lower, `\microsoft\windows\`) {
+				hits = append(hits, RuleHit{
+					RuleName:    "SuspiciousScheduledTaskExecution",
+					Engine:      "sigma",
+					Description: "Non-Microsoft scheduled task executed — verify legitimacy.",
+					Severity:    "medium",
+					MITRETTP:    "T1053.005",
+					MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+					Evidence:    fmt.Sprintf("Task: %s, Action: %s", taskName, action),
+				})
+			}
+		}
+
+	// ── Tier 1: Service Installation ─────────────────────────────────────────
+	case monitor.EventServiceInstall:
+		svcName, _ := ev.Data["service_name"].(string)
+		imgPath, _ := ev.Data["service_imagepath"].(string)
+		svcKey, _ := ev.Data["service_key"].(string)
+		svcValue, _ := ev.Data["service_value"].(string)
+
+		if svcValue == "ImagePath" || svcValue == "" {
+			// New service with an executable path
+			hits = append(hits, RuleHit{
+				RuleName:    "ServiceInstalled",
+				Engine:      "sigma",
+				Description: "A new Windows service was installed — common persistence and privilege escalation mechanism.",
+				Severity:    "high",
+				MITRETTP:    "T1543.003",
+				MatchedOn:   fmt.Sprintf("PID %d", ev.PID),
+				Evidence:    fmt.Sprintf("Service: %s, ImagePath: %s, Key: %s", svcName, imgPath, svcKey),
+			})
+
+			// Escalate for services pointing to suspicious paths
+			lowerImg := strings.ToLower(imgPath)
+			suspiciousSvcPaths := []string{`\temp\`, `\tmp\`, `\appdata\`, `\users\public\`, `\programdata\`}
+			for _, p := range suspiciousSvcPaths {
+				if strings.Contains(lowerImg, p) {
+					hits = append(hits, RuleHit{
+						RuleName:    "ServiceInstalledFromSuspiciousPath",
+						Engine:      "sigma",
+						Description: "Windows service installed pointing to a user-writable path — strong indicator of malicious service installation.",
+						Severity:    "critical",
+						MITRETTP:    "T1543.003",
+						MatchedOn:   fmt.Sprintf("PID %d Service: %s", ev.PID, svcName),
+						Evidence:    fmt.Sprintf("ImagePath: %s (suspicious path: %s)", imgPath, p),
+					})
+					break
+				}
+			}
+		}
 	}
 
 	// External .yml Sigma rules evaluated against every event

@@ -16,28 +16,34 @@ const (
 	EventEvasion          = "evasion_attempt"
 
 	// Task A — Thread + ImageLoad
-	EventThreadCreate = "thread_create" // Remote thread created in foreign process
-	EventImageLoad    = "image_load"    // DLL/module loaded into process
+	EventThreadCreate = "thread_create"
+	EventImageLoad    = "image_load"
 
 	// Task B — Handle
-	EventHandleCreate    = "handle_create"    // Kernel object handle opened
-	EventHandleDuplicate = "handle_duplicate" // Handle duplicated across processes
+	EventHandleCreate    = "handle_create"
+	EventHandleDuplicate = "handle_duplicate"
 
 	// Task C — PowerShell / AMSI
-	EventPowerShell = "powershell_exec" // PowerShell script block logged
-	EventAMSIScan   = "amsi_scan"       // AMSI content scan triggered
+	EventPowerShell = "powershell_exec"
+	EventAMSIScan   = "amsi_scan"
+
+	// Tier 1 — Persistence mechanisms
+	EventWMI            = "wmi_activity"        // T1047  WMI execution / event subscription
+	EventSchedTask      = "scheduled_task"       // T1053.005 Scheduled task created/modified
+	EventServiceInstall = "service_install"      // T1543.003 Windows service installed/modified
 )
 
 // Categories
 const (
-	CatProcess  = "process"
-	CatFile     = "filesystem"
-	CatRegistry = "registry"
-	CatNetwork  = "network"
-	CatAPI      = "api"
-	CatEvasion  = "evasion"
-	CatMemory   = "memory" // Task A: image/thread memory operations
-	CatScript   = "script" // Task C: PowerShell / AMSI script blocks
+	CatProcess     = "process"
+	CatFile        = "filesystem"
+	CatRegistry    = "registry"
+	CatNetwork     = "network"
+	CatAPI         = "api"
+	CatEvasion     = "evasion"
+	CatMemory      = "memory"
+	CatScript      = "script"
+	CatPersistence = "persistence" // WMI, schtasks, services
 )
 
 // Severities

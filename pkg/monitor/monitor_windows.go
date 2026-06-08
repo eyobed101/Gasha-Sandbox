@@ -87,6 +87,9 @@ func (m *WindowsMonitor) Start(ctx context.Context, jobID string, targetPID int,
 		// Task C — AMSI + PowerShell
 		"Microsoft-Antimalware-Scan-Interface", // AMSI content scanning (T1059.001)
 		"Microsoft-Windows-PowerShell",         // Script block logging EventID 4104 (T1059.001)
+		// Tier 1 — Persistence mechanisms
+		"Microsoft-Windows-WMI-Activity",       // WMI execution + event subscriptions (T1047)
+		"Microsoft-Windows-TaskScheduler",      // Scheduled task create/modify (T1053.005)
 	}
 
 	for _, provName := range providers {
@@ -382,6 +385,45 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 				normalized.Data["Details"] = fmt.Sprintf("%v", valData)
 			}
 			normalized.Data["EventType"] = "SetValue"
+
+			// ── Service installation detection (T1543.003) ────────────────
+			// Any write under HKLM\SYSTEM\CurrentControlSet\Services\ that
+			// sets ImagePath, Start, or ObjectName indicates service install/mod.
+			lowerKey := strings.ToLower(keyName)
+			if strings.Contains(lowerKey, `\system\currentcontrolset\services\`) {
+				svcName := extractServiceName(keyName)
+				svcImagePath := ""
+				if valName == "ImagePath" {
+					if vd, ok := e.EventData["ValueData"]; ok {
+						svcImagePath = fmt.Sprintf("%v", vd)
+					}
+				}
+				svcEv := Event{
+					JobID:     m.jobID,
+					Timestamp: normalized.Timestamp,
+					PID:       eventPID,
+					TID:       normalized.TID,
+					EventType: EventServiceInstall,
+					Category:  CatPersistence,
+					Severity:  SevHigh,
+					Data: map[string]interface{}{
+						"service_name":      svcName,
+						"service_key":       keyName,
+						"service_value":     valName,
+						"service_imagepath": svcImagePath,
+						"mitre_ttp":         "T1543.003",
+						// Sigma field names
+						"ServiceName":  svcName,
+						"ImagePath":    svcImagePath,
+						"TargetObject": keyName + "\\" + valName,
+					},
+				}
+				select {
+				case bus <- svcEv:
+				default:
+				}
+				m.correlator.ProcessEvent(svcEv)
+			}
 		} else if strings.Contains(opcodeName, "deletevalue") || e.System.EventID == 7 {
 			normalized.EventType = EventRegDelete
 			normalized.Data["operation"] = "DELETE"
@@ -665,6 +707,115 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		// Sigma ps_script canonical field names
 		normalized.Data["ScriptBlockText"] = scriptBlock
 		normalized.Data["Path"] = path
+
+	// ── Tier 1: WMI Activity ─────────────────────────────────────────────────
+	// Microsoft-Windows-WMI-Activity covers:
+	//   EventID 5860 — Temporary WMI event subscription (T1047)
+	//   EventID 5861 — Permanent WMI event subscription (T1547.003)
+	//   EventID 11   — WMI Execute Method (process/command execution via WMI)
+	case "Microsoft-Windows-WMI-Activity":
+		switch e.System.EventID {
+		case 5860, 5861:
+			// Permanent/temporary event subscription — persistence indicator
+			namespaceName, _ := getPropertyString(e, "NamespaceName")
+			if namespaceName == "" {
+				namespaceName, _ = getPropertyString(e, "Namespace")
+			}
+			consumer, _ := getPropertyString(e, "Consumer")
+			query, _ := getPropertyString(e, "Query")
+			possibleCause, _ := getPropertyString(e, "PossibleCause")
+
+			normalized.Category = CatPersistence
+			normalized.EventType = EventWMI
+			normalized.Severity = SevCritical
+			normalized.Data["wmi_operation"]   = "EventSubscription"
+			normalized.Data["wmi_namespace"]   = namespaceName
+			normalized.Data["wmi_consumer"]    = consumer
+			normalized.Data["wmi_query"]       = query
+			normalized.Data["wmi_cause"]       = possibleCause
+			normalized.Data["mitre_ttp"]       = "T1547.003"
+			normalized.Data["subscription_type"] = map[bool]string{true: "Permanent", false: "Temporary"}[e.System.EventID == 5861]
+
+		case 11:
+			// WMI method execution — commonly Win32_Process.Create
+			namespaceName, _ := getPropertyString(e, "NamespaceName")
+			operation, _ := getPropertyString(e, "Operation")
+			clientPID, _ := getPropertyInt(e, "ClientProcessId")
+
+			normalized.Category = CatPersistence
+			normalized.EventType = EventWMI
+			normalized.Severity = SevHigh
+			normalized.Data["wmi_operation"]  = "MethodExecution"
+			normalized.Data["wmi_namespace"]  = namespaceName
+			normalized.Data["wmi_method"]     = operation
+			normalized.Data["client_pid"]     = clientPID
+			normalized.Data["mitre_ttp"]      = "T1047"
+
+		default:
+			// Any other WMI activity from a monitored PID is worth recording
+			operation, _ := getPropertyString(e, "Operation")
+			if operation == "" {
+				return
+			}
+			normalized.Category = CatPersistence
+			normalized.EventType = EventWMI
+			normalized.Severity = SevMedium
+			normalized.Data["wmi_operation"] = operation
+			normalized.Data["mitre_ttp"]     = "T1047"
+		}
+
+	// ── Tier 1: Task Scheduler ────────────────────────────────────────────────
+	// Microsoft-Windows-TaskScheduler covers:
+	//   EventID 106 — Task registered (T1053.005)
+	//   EventID 140 — Task updated (T1053.005)
+	//   EventID 141 — Task deleted
+	//   EventID 200 — Task action started (execution)
+	case "Microsoft-Windows-TaskScheduler":
+		taskName, _ := getPropertyString(e, "TaskName")
+		if taskName == "" {
+			taskName, _ = getPropertyString(e, "Path")
+		}
+
+		switch e.System.EventID {
+		case 106, 140:
+			// Task registered or updated
+			userContext, _ := getPropertyString(e, "UserContext")
+			instanceID, _ := getPropertyString(e, "InstanceId")
+
+			normalized.Category = CatPersistence
+			normalized.EventType = EventSchedTask
+			normalized.Severity = SevHigh
+			normalized.Data["task_name"]     = taskName
+			normalized.Data["task_operation"] = map[uint16]string{106: "Registered", 140: "Updated"}[e.System.EventID]
+			normalized.Data["user_context"]  = userContext
+			normalized.Data["instance_id"]   = instanceID
+			normalized.Data["mitre_ttp"]     = "T1053.005"
+			// Sigma field names for community rules
+			normalized.Data["TaskName"]      = taskName
+			normalized.Data["UserContext"]   = userContext
+
+		case 200:
+			// Task action started — track what's being executed
+			actionName, _ := getPropertyString(e, "ActionName")
+			normalized.Category = CatPersistence
+			normalized.EventType = EventSchedTask
+			normalized.Severity = SevMedium
+			normalized.Data["task_name"]    = taskName
+			normalized.Data["task_operation"] = "ActionStarted"
+			normalized.Data["action_name"]  = actionName
+			normalized.Data["mitre_ttp"]    = "T1053.005"
+
+		case 141:
+			normalized.Category = CatPersistence
+			normalized.EventType = EventSchedTask
+			normalized.Severity = SevLow
+			normalized.Data["task_name"]      = taskName
+			normalized.Data["task_operation"] = "Deleted"
+			normalized.Data["mitre_ttp"]      = "T1053.005"
+
+		default:
+			return
+		}
 
 	default:
 		return
@@ -1134,3 +1285,20 @@ func getSignatureStatus(imagePath string) string {
 
 func sha256sum(data []byte) [32]byte { return sha256.Sum256(data) }
 func md5sum(data []byte) [16]byte    { return md5.Sum(data) }
+
+// extractServiceName parses the service name from a registry key path of the form:
+// HKLM\SYSTEM\CurrentControlSet\Services\<ServiceName>[\subkey]
+func extractServiceName(keyPath string) string {
+	lower := strings.ToLower(keyPath)
+	marker := `\services\`
+	idx := strings.Index(lower, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := keyPath[idx+len(marker):]
+	// Take only the first path component (the service name itself)
+	if slash := strings.IndexByte(rest, '\\'); slash >= 0 {
+		return rest[:slash]
+	}
+	return rest
+}
