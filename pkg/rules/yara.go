@@ -2,11 +2,12 @@ package rules
 
 import (
 	"bytes"
-	"debug/pe"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+
+	"github.com/lemas-sandbox/lemas/pkg/peparser"
 )
 
 type YaraScanner struct {
@@ -55,7 +56,7 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 	isPE := len(data) > 2 && data[0] == 'M' && data[1] == 'Z'
 
 	if isPE {
-		// Calculate file entropy
+		// Calculate whole-file entropy (fast pre-check)
 		entropy := CalculateEntropy(data)
 		if entropy > 7.2 {
 			hits = append(hits, RuleHit{
@@ -69,40 +70,18 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 			})
 		}
 
-		// Use Go's built-in PE parser
-		f, err := pe.Open(path)
-		if err == nil {
-			defer f.Close()
-
-			// Scan imports for injection APIs
-			imports, _ := f.ImportedSymbols()
-			suspiciousImports := map[string]bool{
-				"VirtualAlloc":          true,
-				"VirtualAllocEx":        true,
-				"WriteProcessMemory":    true,
-				"CreateRemoteThread":    true,
-				"NtCreateThreadEx":      true,
-				"IsDebuggerPresent":     true,
-				"CheckRemoteDebugger":   true,
-				"NtDelayExecution":      true,
-			}
-
-			matchedImports := 0
-			for _, imp := range imports {
-				if suspiciousImports[imp] {
-					matchedImports++
-				}
-			}
-
-			if matchedImports >= 3 {
+		// Deep PE analysis via saferwall/pe — malformation-tolerant, richer than debug/pe
+		peResult, err := peparser.Analyze(path)
+		if err == nil && peResult != nil {
+			for _, h := range peResult.Hits {
 				hits = append(hits, RuleHit{
-					RuleName:    "ProcessInjectionAPIImports",
-					Engine:      "yara",
-					Description: "PE imports multiple APIs commonly used for process hollowing and injection.",
-					Severity:    "high",
-					MITRETTP:    "T1055",
-					MatchedOn:   path,
-					Evidence:    fmt.Sprintf("Matched %d injection API imports", matchedImports),
+					RuleName:    h.RuleName,
+					Engine:      h.Engine,
+					Description: h.Description,
+					Severity:    h.Severity,
+					MITRETTP:    h.MITRETTP,
+					MatchedOn:   h.MatchedOn,
+					Evidence:    h.Evidence,
 				})
 			}
 		}

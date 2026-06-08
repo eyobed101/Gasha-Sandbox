@@ -12,12 +12,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lemas-sandbox/lemas/pkg/capture"
 	"github.com/lemas-sandbox/lemas/pkg/isolation"
+	"github.com/lemas-sandbox/lemas/pkg/logger"
 	"github.com/lemas-sandbox/lemas/pkg/monitor"
 	"github.com/lemas-sandbox/lemas/pkg/report"
 	"github.com/lemas-sandbox/lemas/pkg/rules"
 	"github.com/lemas-sandbox/lemas/pkg/storage"
 )
+
+var log = logger.ForComponent("orchestrator")
 
 type Orchestrator struct {
 	store      *storage.Store
@@ -102,35 +106,40 @@ func (o *Orchestrator) Start(ctx context.Context) {
 }
 
 func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
+	jlog := logger.ForJob(job.ID)
 	job.StartedAt = time.Now()
 	job.Status = "running"
 	o.store.SaveJob(*job)
 
 	profile := GetProfileForFile(job.FilePath)
+	jlog.Info().Str("file", job.FilePath).Str("type", job.FileType).Msg("job started")
 
 	outJSON := filepath.Join(o.reportsDir, job.ID, "report.json")
 	outHTML := filepath.Join(o.reportsDir, job.ID, "report.html")
 
 	// --- STEP 1: Static scan ---
 	hits := o.rules.ScanFile(job.FilePath)
+	jlog.Debug().Int("static_hits", len(hits)).Msg("static scan complete")
 
 	// --- STEP 2: Setup instrumentation bus ---
 	bus := monitor.NewInstrumentationBus()
-
-	// publishChan: write-only channel that monitors push events into
 	publishChan := make(chan monitor.Event, 5000)
-
-	// Consumer side: read events and store + rule-evaluate
 	consumerChan := make(chan monitor.Event, 1000)
 	bus.RegisterConsumer(consumerChan)
 	bus.StartPipeline(ctx)
 
-	// Bridge publishChan → bus
 	go func() {
 		for ev := range publishChan {
 			bus.Publish(ev)
 		}
 	}()
+
+	// --- STEP 2b: PCAP writer (non-fatal if init fails) ---
+	pcapWriter, pcapErr := capture.NewWriter(job.ID, o.reportsDir, 100)
+	if pcapErr != nil {
+		jlog.Warn().Err(pcapErr).Msg("pcap capture disabled for this job")
+		pcapWriter = nil
+	}
 
 	var ruleHitsMu sync.Mutex
 	allHits := append([]rules.RuleHit{}, hits...)
@@ -143,6 +152,20 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 				ruleHitsMu.Lock()
 				allHits = append(allHits, sigmaHits...)
 				ruleHitsMu.Unlock()
+			}
+
+			// Write synthetic PCAP packet for network events
+			if pcapWriter != nil && (ev.EventType == monitor.EventNetConnect || ev.EventType == monitor.EventNetDNS) {
+				srcIP, _ := ev.Data["SourceIp"].(string)
+				dstIP, _ := ev.Data["DestinationIp"].(string)
+				if dstIP == "" {
+					dstIP, _ = ev.Data["dest_ip"].(string)
+				}
+				srcPort, _ := ev.Data["SourcePort"].(int)
+				dstPort, _ := ev.Data["dest_port"].(int)
+				if dstIP != "" {
+					_ = pcapWriter.WriteSyntheticTCPPacket(ev.Timestamp, srcIP, dstIP, srcPort, dstPort, nil)
+				}
 			}
 
 			// Task C: inline YARA scan for PowerShell script blocks and AMSI content
@@ -173,25 +196,34 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 
 	proc, err := o.iso.CreateProcess(runCtx, profile.LaunchPath, profile.LaunchArgs, filepath.Dir(job.FilePath), limits)
 	if err != nil {
+		jlog.Error().Err(err).Msg("failed to create isolated process")
 		job.CompletedAt = time.Now()
 		job.Status = "failed"
 		o.store.SaveJob(*job)
 		close(publishChan)
 		bus.StopPipeline()
+		if pcapWriter != nil {
+			pcapWriter.Close()
+		}
 		return
 	}
 
 	// --- STEP 4: Start telemetry monitor ---
 	mon := monitor.NewMonitor()
 	if err := mon.Start(runCtx, job.ID, proc.PID(), publishChan); err != nil {
+		jlog.Error().Err(err).Msg("telemetry monitor failed to start")
 		proc.Kill()
 		job.CompletedAt = time.Now()
 		job.Status = "failed"
 		o.store.SaveJob(*job)
 		close(publishChan)
 		bus.StopPipeline()
+		if pcapWriter != nil {
+			pcapWriter.Close()
+		}
 		return
 	}
+
 	// --- STEP 5: Wait for process termination ---
 	var exitCode int
 	doneChan := make(chan struct{})
@@ -210,30 +242,33 @@ func (o *Orchestrator) executeJob(ctx context.Context, job *storage.Job) {
 	}
 
 	mon.Stop()
-	time.Sleep(300 * time.Millisecond) // let bus drain
+	time.Sleep(300 * time.Millisecond)
 	close(publishChan)
 	bus.StopPipeline()
 
+	if pcapWriter != nil {
+		pcapWriter.Close()
+		jlog.Info().Str("pcap", pcapWriter.Path()).Int64("bytes", pcapWriter.Written()).Msg("network capture saved")
+	}
+
 	// --- STEP 6: Post-execution memory inspection ---
-	// Run a full VirtualQuery walk + PE reconstruction + module diff on the
-	// analysis process.  Results feed directly into the YARA scan pipeline.
 	memFindings := monitor.InspectProcess(job.ID, proc.PID(), publishChan)
 	for _, f := range memFindings {
-		// Re-scan each dumped region content through YARA if it contains a PE
 		if f.FindingID == "UnbackedPE" || f.FindingID == "HiddenModule" {
-			memHits := o.rules.ScanMemory(proc.PID(), f.Address, []byte{0x4D, 0x5A}) // MZ sentinel
+			memHits := o.rules.ScanMemory(proc.PID(), f.Address, []byte{0x4D, 0x5A})
 			ruleHitsMu.Lock()
 			allHits = append(allHits, memHits...)
 			ruleHitsMu.Unlock()
 		}
 	}
-	// Fall back to legacy stub scan on timeout/non-zero exit for coverage
 	if (job.Status == "timeout" || exitCode != 0) && len(memFindings) == 0 {
 		memHits := o.rules.ScanMemory(proc.PID(), "0x00400000", []byte("MZ header in unbacked memory... mimikatz"))
 		ruleHitsMu.Lock()
 		allHits = append(allHits, memHits...)
 		ruleHitsMu.Unlock()
 	}
+
+	jlog.Info().Str("status", job.Status).Int("rule_hits", len(allHits)).Msg("job finished")
 
 	// --- STEP 7: Generate reports ---
 	report.GenerateReport(job.ID, o.store, allHits, outJSON, outHTML)

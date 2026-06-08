@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -13,57 +12,63 @@ import (
 	"time"
 
 	"github.com/lemas-sandbox/lemas/pkg/integration"
+	"github.com/lemas-sandbox/lemas/pkg/logger"
 	"github.com/lemas-sandbox/lemas/pkg/orchestrator"
+	"github.com/rs/zerolog"
 )
 
+var log = logger.ForComponent("main")
+
 func main() {
-	// 1. Setup CLI flags
+	// ── CLI flags ─────────────────────────────────────────────────────────────
 	daemonMode := flag.Bool("daemon", false, "Start LEMAS as a background REST API server")
 	listenAddr := flag.String("addr", ":8080", "Address for REST API server to listen on")
-	filePath := flag.String("file", "", "Path to the file to analyze (standalone mode)")
-	dbPath := flag.String("db", "./lemas.db", "Path to SQLite database")
+	filePath   := flag.String("file", "", "Path to the file to analyze (standalone mode)")
+	dbPath     := flag.String("db", "./lemas.db", "Path to SQLite database")
 	reportsDir := flag.String("reports", "./reports", "Directory to write analysis reports")
-	rulesDir := flag.String("rules", "./rules", "Directory containing YARA/Sigma rules")
-
+	rulesDir   := flag.String("rules", "./rules", "Directory containing YARA/Sigma rules")
+	verbose    := flag.Bool("verbose", false, "Enable debug-level logging")
 	flag.Parse()
 
-	// Ensure rule directory exists
+	if *verbose {
+		logger.SetLevel(zerolog.DebugLevel)
+	}
+
+	// API key from env (preferred) or auto-disabled in dev
+	apiKey := os.Getenv("LEMAS_API_KEY")
+
 	os.MkdirAll(*rulesDir, 0755)
 	os.MkdirAll(*reportsDir, 0755)
 
-	// 2. Initialize orchestrator
+	// ── Orchestrator ──────────────────────────────────────────────────────────
 	orch, err := orchestrator.NewOrchestrator(*dbPath, *reportsDir, *rulesDir)
 	if err != nil {
-		log.Fatalf("Failed to initialize LEMAS core engine: %v", err)
+		log.Fatal().Err(err).Msg("failed to initialize LEMAS core engine")
 	}
 	defer orch.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start orchestrator background loop
 	orch.Start(ctx)
 
-	// 3. Select mode
+	// ── Mode selection ────────────────────────────────────────────────────────
 	if *daemonMode {
-		log.Printf("Starting LEMAS Daemon on %s...", *listenAddr)
-		server := integration.NewAPIServer(orch, *reportsDir)
-		
+		server := integration.NewAPIServer(orch, *reportsDir, apiKey)
 		go func() {
 			if err := server.Start(*listenAddr); err != nil {
-				log.Fatalf("REST API server failed: %v", err)
+				log.Fatal().Err(err).Msg("REST API server failed")
 			}
 		}()
 
-		// Graceful shutdown
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
-		log.Println("Shutting down LEMAS Daemon...")
+		log.Info().Msg("shutting down LEMAS daemon")
 	} else {
-		// Standalone Mode
+		// ── Standalone analysis mode ──────────────────────────────────────────
 		if *filePath == "" {
-			fmt.Println("LEMAS - Lightweight Endpoint Malware Analysis Sandbox")
+			fmt.Println("LEMAS — Lightweight Endpoint Malware Analysis Sandbox")
 			fmt.Println("Usage:")
 			flag.PrintDefaults()
 			os.Exit(1)
@@ -71,47 +76,43 @@ func main() {
 
 		absPath, err := filepath.Abs(*filePath)
 		if err != nil {
-			log.Fatalf("Failed to resolve absolute file path: %v", err)
+			log.Fatal().Err(err).Msg("failed to resolve file path")
 		}
 
-		log.Printf("[+] Submitting target file: %s", absPath)
+		log.Info().Str("path", absPath).Msg("submitting target file")
 		jobID, err := orch.SubmitJob(absPath)
 		if err != nil {
-			log.Fatalf("Submission failed: %v", err)
+			log.Fatal().Err(err).Msg("submission failed")
 		}
+		log.Info().Str("job_id", jobID).Msg("job queued — running analysis")
 
-		log.Printf("[+] Analysis job queued. ID: %s", jobID)
-		log.Printf("[*] Executing analysis... (max timeout: 120s)")
-
-		// Poll status until completed
 		reportJSONPath := filepath.Join(*reportsDir, jobID, "report.json")
-		ticker := time.NewTicker(1 * time.Second)
+		ticker  := time.NewTicker(1 * time.Second)
+		timeout := time.After(130 * time.Second)
 		defer ticker.Stop()
 
-		timeout := time.After(130 * time.Second)
 		for {
 			select {
 			case <-ticker.C:
 				status, err := orch.GetJobStatus(jobID)
 				if err != nil {
-					log.Printf("[!] Warning: failed to check job status: %v", err)
+					log.Warn().Err(err).Msg("could not check job status")
 					continue
 				}
-
 				switch status {
 				case "failed":
-					log.Fatalf("[-] Analysis failed. This usually occurs when lacking elevated context required for real-time kernel-level harvesters (ETW/eBPF). Please run as Administrator or root.")
+					log.Fatal().Msg("analysis failed — ensure the process is running with admin/root privileges")
 				case "completed", "timeout":
 					if _, err := os.Stat(reportJSONPath); err == nil {
-						log.Printf("[+] Analysis complete (status: %s)!", status)
+						log.Info().Str("status", status).Msg("analysis complete")
 						printSummary(reportJSONPath)
 						return
 					} else if status == "timeout" {
-						log.Fatalf("[-] Analysis timeout and no report was generated.")
+						log.Fatal().Msg("analysis timed out with no report generated")
 					}
 				}
 			case <-timeout:
-				log.Fatalf("[-] Analysis timed out waiting for reports.")
+				log.Fatal().Msg("polling timed out waiting for report")
 			}
 		}
 	}
@@ -120,7 +121,7 @@ func main() {
 func printSummary(jsonReportPath string) {
 	data, err := os.ReadFile(jsonReportPath)
 	if err != nil {
-		log.Fatalf("Failed to read report: %v", err)
+		log.Fatal().Err(err).Msg("failed to read report")
 	}
 
 	var rep struct {
@@ -131,21 +132,20 @@ func printSummary(jsonReportPath string) {
 			KeyBehaviors      []string `json:"key_behaviors"`
 		} `json:"summary"`
 	}
-
 	if err := json.Unmarshal(data, &rep); err != nil {
-		log.Fatalf("Failed to parse report: %v", err)
+		log.Fatal().Err(err).Msg("failed to parse report JSON")
 	}
 
 	fmt.Println("\n=========================================")
-	fmt.Println("           ANALYSIS RUN SUMMARY          ")
+	fmt.Println("          ANALYSIS SUMMARY               ")
 	fmt.Println("=========================================")
-	fmt.Printf("THREAT CLASSIFICATION : %s\n", rep.Summary.ThreatLevel)
-	fmt.Printf("THREAT SCORE (0-100)  : %d\n", rep.Summary.ThreatScore)
-	fmt.Printf("BEHAVIOR SUMMARY      : %s\n", rep.Summary.BehavioralSummary)
-	fmt.Println("KEY DETECTED BEHAVIORS:")
+	fmt.Printf("THREAT LEVEL  : %s\n", rep.Summary.ThreatLevel)
+	fmt.Printf("THREAT SCORE  : %d / 100\n", rep.Summary.ThreatScore)
+	fmt.Printf("SUMMARY       : %s\n", rep.Summary.BehavioralSummary)
+	fmt.Println("KEY BEHAVIORS :")
 	for _, b := range rep.Summary.KeyBehaviors {
-		fmt.Printf(" - %s\n", b)
+		fmt.Printf("  - %s\n", b)
 	}
 	fmt.Println("=========================================")
-	fmt.Printf("Full HTML Report saved at: %s\n", filepath.Join(filepath.Dir(jsonReportPath), "report.html"))
+	fmt.Printf("HTML report → %s\n", filepath.Join(filepath.Dir(jsonReportPath), "report.html"))
 }
