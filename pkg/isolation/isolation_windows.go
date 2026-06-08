@@ -7,41 +7,64 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
+	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
+
+// ─── Win32 proc bindings ──────────────────────────────────────────────────────
 
 var (
-	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
+	modKernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
-	procCreateJobObjectW           = modkernel32.NewProc("CreateJobObjectW")
-	procSetInformationJobObject    = modkernel32.NewProc("SetInformationJobObject")
-	procAssignProcessToJobObject   = modkernel32.NewProc("AssignProcessToJobObject")
-	procCloseHandle                = modkernel32.NewProc("CloseHandle")
-	procTerminateJobObject         = modkernel32.NewProc("TerminateJobObject")
+	procCreateJobObjectW         = modKernel32.NewProc("CreateJobObjectW")
+	procSetInformationJobObject  = modKernel32.NewProc("SetInformationJobObject")
+	procAssignProcessToJobObject = modKernel32.NewProc("AssignProcessToJobObject")
+	procTerminateJobObject       = modKernel32.NewProc("TerminateJobObject")
+	procCreateProcessW           = modKernel32.NewProc("CreateProcessW")
+	procResumeThread             = modKernel32.NewProc("ResumeThread")
+	procCreatePipe               = modKernel32.NewProc("CreatePipe")
+	procSetHandleInformation     = modKernel32.NewProc("SetHandleInformation")
 )
+
+// ─── Win32 constants ──────────────────────────────────────────────────────────
 
 const (
-	// JobObjectInfoClass constants
-	JobObjectAssociateCompletionPortInformation = 7
-	JobObjectBasicLimitInformation             = 2
-	JobObjectBasicUriFilters                   = 14
-	JobObjectCpuRateControlInformation         = 15
-	JobObjectExtendedLimitInformation          = 9
+	// Job object info classes
+	jobObjectExtendedLimitInformation  = 9
+	jobObjectCpuRateControlInformation = 15
 
-	// Extended limit flags
-	JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-	JOB_OBJECT_LIMIT_JOB_MEMORY        = 0x00000400
-	JOB_OBJECT_LIMIT_PROCESS_MEMORY    = 0x00000100
-	JOB_OBJECT_LIMIT_ACTIVE_PROCESS    = 0x00000008
+	// Job object limit flags
+	jobLimitKillOnJobClose  = 0x00002000
+	jobLimitJobMemory       = 0x00000400
+	jobLimitProcessMemory   = 0x00000100
+	jobLimitActiveProcess   = 0x00000008
 
 	// CPU rate control flags
-	JOB_OBJECT_CPU_RATE_CONTROL_ENABLE       = 0x0001
-	JOB_OBJECT_CPU_RATE_CONTROL_HARD_LIMIT   = 0x0004
+	jobCPURateControlEnable    = 0x0001
+	jobCPURateControlHardLimit = 0x0004
+
+	// Process creation flags
+	createSuspended             = 0x00000004
+	createNewConsole            = 0x00000010
+	createNoWindow              = 0x08000000
+	inheritParentAffinity       = 0x00010000
+
+	// Handle flags
+	handleFlagInherit = 0x00000001
+
+	// Process access rights
+	processAllAccess = 0x1F0FFF
+
+	// ResumeThread returns 0xFFFFFFFF on error
+	resumeThreadError = ^uintptr(0)
 )
 
-type JOBOBJECT_BASIC_LIMIT_INFORMATION struct {
+// ─── Win32 structs ────────────────────────────────────────────────────────────
+
+type jobObjectBasicLimitInfo struct {
 	PerProcessUserTimeLimit int64
 	PerJobUserTimeLimit     int64
 	LimitFlags              uint32
@@ -53,7 +76,7 @@ type JOBOBJECT_BASIC_LIMIT_INFORMATION struct {
 	SchedulingClass         uint32
 }
 
-type IO_COUNTERS struct {
+type ioCounters struct {
 	ReadOperationCount  uint64
 	WriteOperationCount uint64
 	OtherOperationCount uint64
@@ -62,193 +85,391 @@ type IO_COUNTERS struct {
 	OtherTransferCount  uint64
 }
 
-type JOBOBJECT_EXTENDED_LIMIT_INFORMATION struct {
-	BasicLimitInformation JOBOBJECT_BASIC_LIMIT_INFORMATION
-	IoInfo                IO_COUNTERS
+type jobObjectExtendedLimitInfo struct {
+	BasicLimitInformation jobObjectBasicLimitInfo
+	IoInfo                ioCounters
 	ProcessMemoryLimit    uintptr
 	JobMemoryLimit        uintptr
 	PeakProcessMemoryUsed uintptr
 	PeakJobMemoryUsed     uintptr
 }
 
-type JOBOBJECT_CPU_RATE_CONTROL_INFORMATION struct {
+type jobObjectCPURateControlInfo struct {
 	ControlFlags uint32
-	CpuRate      uint32 // Percent * 100
+	CpuRate      uint32
 }
 
-// WindowsJobProcess implements isolation.Process
+// STARTUPINFOW matches the Win32 STARTUPINFOW layout exactly.
+type startupInfoW struct {
+	Cb              uint32
+	_               *uint16 // lpReserved
+	Desktop         *uint16
+	Title           *uint16
+	X               uint32
+	Y               uint32
+	XSize           uint32
+	YSize           uint32
+	XCountChars     uint32
+	YCountChars     uint32
+	FillAttribute   uint32
+	Flags           uint32
+	ShowWindow      uint16
+	_               uint16 // cbReserved2
+	_               *byte  // lpReserved2
+	StdInput        syscall.Handle
+	StdOutput       syscall.Handle
+	StdError        syscall.Handle
+}
+
+// PROCESS_INFORMATION matches the Win32 PROCESS_INFORMATION layout.
+type processInformation struct {
+	Process   syscall.Handle
+	Thread    syscall.Handle
+	ProcessID uint32
+	ThreadID  uint32
+}
+
+const startfUseStdHandles = 0x00000100
+
+// ─── WindowsJobProcess ────────────────────────────────────────────────────────
+
+// WindowsJobProcess implements isolation.Process.
+// The sandboxed process is spawned suspended, assigned to a Job Object,
+// then resumed — closing the race window where fast-spawning malware could
+// escape containment between CreateProcess and AssignProcessToJobObject.
 type WindowsJobProcess struct {
-	cmd       *exec.Cmd
-	jobHandle syscall.Handle
-	stdout    io.Reader
-	stderr    io.Reader
+	pid          int
+	procHandle   syscall.Handle
+	jobHandle    syscall.Handle
+	stdoutReader *os.File
+	stderrReader *os.File
+	// write ends kept open until Wait() so the readers don't get EOF early
+	stdoutWriter *os.File
+	stderrWriter *os.File
+	// waitDone is closed after the process exits
+	waitOnce chan struct{}
+	exitCode int
 }
 
-func (p *WindowsJobProcess) PID() int {
-	if p.cmd.Process != nil {
-		return p.cmd.Process.Pid
-	}
-	return 0
-}
+func (p *WindowsJobProcess) PID() int { return p.pid }
 
 func (p *WindowsJobProcess) Kill() error {
-	// Terminate the entire job object recursively killing all processes inside it.
 	r1, _, err := procTerminateJobObject.Call(uintptr(p.jobHandle), 1)
 	if r1 == 0 {
-		return fmt.Errorf("failed to terminate job object: %v", err)
+		return fmt.Errorf("TerminateJobObject: %v", err)
 	}
 	return nil
 }
 
 func (p *WindowsJobProcess) Wait() (int, error) {
-	err := p.cmd.Wait()
-	// Close job handle once wait is done
-	procCloseHandle.Call(uintptr(p.jobHandle))
-	
+	// Block until the primary process exits.
+	_, err := syscall.WaitForSingleObject(p.procHandle, syscall.INFINITE)
 	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			return exitError.ExitCode(), nil
-		}
-		return -1, err
+		return -1, fmt.Errorf("WaitForSingleObject: %v", err)
 	}
-	return 0, nil
+
+	var code uint32
+	if err := syscall.GetExitCodeProcess(p.procHandle, &code); err != nil {
+		code = 0
+	}
+
+	// Close write ends of pipes so readers reach EOF.
+	p.stdoutWriter.Close()
+	p.stderrWriter.Close()
+
+	syscall.CloseHandle(p.procHandle)
+	procCloseHandleW(p.jobHandle)
+
+	return int(code), nil
 }
 
-func (p *WindowsJobProcess) Stdout() io.Reader {
-	return p.stdout
+func (p *WindowsJobProcess) Stdout() io.Reader { return p.stdoutReader }
+func (p *WindowsJobProcess) Stderr() io.Reader { return p.stderrReader }
+
+// procCloseHandleW is a thin wrapper so we can call kernel32.CloseHandle
+// without importing the full windows package handle type here.
+func procCloseHandleW(h syscall.Handle) {
+	syscall.CloseHandle(h)
 }
 
-func (p *WindowsJobProcess) Stderr() io.Reader {
-	return p.stderr
-}
+// ─── WindowsIsolationProvider ─────────────────────────────────────────────────
 
-// WindowsIsolationProvider implements isolation.Provider
 type WindowsIsolationProvider struct{}
 
 func NewProvider() *WindowsIsolationProvider {
 	return &WindowsIsolationProvider{}
 }
 
-func (w *WindowsIsolationProvider) CreateProcess(ctx context.Context, path string, args []string, dir string, limits Limits) (Process, error) {
-	// 1. Create Windows Job Object
-	r1, _, err := procCreateJobObjectW.Call(0, 0)
-	if r1 == 0 {
-		return nil, fmt.Errorf("failed to create job object: %v", err)
-	}
-	jobHandle := syscall.Handle(r1)
+// CreateProcess spawns the target binary under a fully configured Job Object.
+//
+// Race-free sequence:
+//  1. Create + configure Job Object with all resource limits
+//  2. Call CreateProcessW with CREATE_SUSPENDED — process image is mapped but
+//     the primary thread has not executed a single instruction yet
+//  3. AssignProcessToJobObject — guaranteed before any user code runs
+//  4. ResumeThread — primary thread starts executing inside the job
+//
+// This eliminates the window between step 2 and 3 where the old code
+// (using exec.Cmd + CREATE_NEW_CONSOLE) allowed the process to run freely
+// and potentially spawn child processes that escape the Job Object.
+func (w *WindowsIsolationProvider) CreateProcess(
+	ctx context.Context,
+	path string,
+	args []string,
+	dir string,
+	limits Limits,
+) (Process, error) {
 
-	// Configure job limits
-	var limitInfo JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	limitInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-
-	if limits.MemoryLimitMB > 0 {
-		limitBytes := uintptr(limits.MemoryLimitMB * 1024 * 1024)
-		limitInfo.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-		limitInfo.JobMemoryLimit = limitBytes
-		limitInfo.ProcessMemoryLimit = limitBytes
-	}
-
-	if limits.MaxProcesses > 0 {
-		limitInfo.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-		limitInfo.BasicLimitInformation.ActiveProcessLimit = uint32(limits.MaxProcesses)
-	}
-
-	// Apply extended limits
-	r1, _, err = procSetInformationJobObject.Call(
-		uintptr(jobHandle),
-		JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&limitInfo)),
-		uintptr(unsafe.Sizeof(limitInfo)),
-	)
-	if r1 == 0 {
-		procCloseHandle.Call(uintptr(jobHandle))
-		return nil, fmt.Errorf("failed to set job object extended limit info: %v", err)
+	// ── Step 1: Create Job Object ─────────────────────────────────────────
+	jobH, err := createJobObject()
+	if err != nil {
+		return nil, err
 	}
 
-	// Apply CPU limit (if specified)
-	if limits.CPULimitPercent > 0 && limits.CPULimitPercent < 100 {
-		var cpuInfo JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
-		cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_LIMIT
-		cpuInfo.CpuRate = uint32(limits.CPULimitPercent * 100) // E.g. 25% CPU = 2500
+	if err := applyJobLimits(jobH, limits); err != nil {
+		syscall.CloseHandle(jobH)
+		return nil, err
+	}
 
-		r1, _, err = procSetInformationJobObject.Call(
-			uintptr(jobHandle),
-			JobObjectCpuRateControlInformation,
-			uintptr(unsafe.Pointer(&cpuInfo)),
-			uintptr(unsafe.Sizeof(cpuInfo)),
-		)
-		if r1 == 0 {
-			// CPU limits might fail on some Windows setups if not run as Admin or virtualization limits, we log and proceed or error.
-			// Let's log it, but proceed as memory limits are critical.
+	// ── Step 2: Build anonymous pipe pairs for stdout/stderr ──────────────
+	stdoutR, stdoutW, err := newInheritablePipe()
+	if err != nil {
+		syscall.CloseHandle(jobH)
+		return nil, fmt.Errorf("stdout pipe: %v", err)
+	}
+	stderrR, stderrW, err := newInheritablePipe()
+	if err != nil {
+		stdoutR.Close(); stdoutW.Close()
+		syscall.CloseHandle(jobH)
+		return nil, fmt.Errorf("stderr pipe: %v", err)
+	}
+
+	// ── Step 3: CreateProcessW with CREATE_SUSPENDED ──────────────────────
+	//
+	// We call CreateProcessW directly instead of exec.Cmd so that:
+	//   a) We can pass CREATE_SUSPENDED in dwCreationFlags
+	//   b) We get PROCESS_INFORMATION back, which contains hThread — the
+	//      primary thread handle needed for ResumeThread
+	//
+	// exec.Cmd.Start() does not expose hThread and does not support
+	// CREATE_SUSPENDED in a way that lets us retrieve the thread handle.
+
+	cmdLine := buildCommandLine(path, args)
+	cmdLinePtr, err := syscall.UTF16PtrFromString(cmdLine)
+	if err != nil {
+		stdoutR.Close(); stdoutW.Close()
+		stderrR.Close(); stderrW.Close()
+		syscall.CloseHandle(jobH)
+		return nil, fmt.Errorf("UTF16 cmdline: %v", err)
+	}
+
+	var workDirPtr *uint16
+	if dir != "" {
+		workDirPtr, err = syscall.UTF16PtrFromString(dir)
+		if err != nil {
+			stdoutR.Close(); stdoutW.Close()
+			stderrR.Close(); stderrW.Close()
+			syscall.CloseHandle(jobH)
+			return nil, fmt.Errorf("UTF16 workdir: %v", err)
 		}
 	}
 
-	// 2. Prepare Command
-	cmd := exec.CommandContext(ctx, path, args...)
-	cmd.Dir = dir
+	si := startupInfoW{
+		Flags:     startfUseStdHandles,
+		StdInput:  syscall.Handle(0), // no stdin for sandboxed process
+		StdOutput: syscall.Handle(stdoutW.Fd()),
+		StdError:  syscall.Handle(stderrW.Fd()),
+	}
+	si.Cb = uint32(unsafe.Sizeof(si))
 
-	// Setup pipes for output capture
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		procCloseHandle.Call(uintptr(jobHandle))
-		return nil, fmt.Errorf("failed to create stdout pipe: %v", err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		procCloseHandle.Call(uintptr(jobHandle))
-		return nil, fmt.Errorf("failed to create stderr pipe: %v", err)
-	}
+	var pi processInformation
 
-	// Configure sandbox execution options.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: 0x00000010, // CREATE_NEW_CONSOLE
-	}
+	creationFlags := uint32(createSuspended | createNoWindow)
 
-	// Start the process.
-	if err := cmd.Start(); err != nil {
-		procCloseHandle.Call(uintptr(jobHandle))
-		return nil, fmt.Errorf("failed to start process: %v", err)
-	}
-
-	// Assign process handle to Job Object immediately.
-	pHandle := getProcessHandle(cmd.Process)
-	if pHandle != 0 {
-		defer syscall.Close(pHandle)
-	}
-	r1, _, err = procAssignProcessToJobObject.Call(uintptr(jobHandle), uintptr(pHandle))
+	r1, _, lastErr := procCreateProcessW.Call(
+		0,                                      // lpApplicationName (null — use cmdLine)
+		uintptr(unsafe.Pointer(cmdLinePtr)),    // lpCommandLine
+		0,                                      // lpProcessAttributes
+		0,                                      // lpThreadAttributes
+		1,                                      // bInheritHandles = TRUE (for pipe handles)
+		uintptr(creationFlags),                 // dwCreationFlags
+		0,                                      // lpEnvironment (inherit parent)
+		uintptr(unsafe.Pointer(workDirPtr)),    // lpCurrentDirectory
+		uintptr(unsafe.Pointer(&si)),           // lpStartupInfo
+		uintptr(unsafe.Pointer(&pi)),           // lpProcessInformation
+	)
 	if r1 == 0 {
-		cmd.Process.Kill()
-		procCloseHandle.Call(uintptr(jobHandle))
-		return nil, fmt.Errorf("failed to assign process to job object: %v", err)
+		stdoutR.Close(); stdoutW.Close()
+		stderrR.Close(); stderrW.Close()
+		syscall.CloseHandle(jobH)
+		return nil, fmt.Errorf("CreateProcessW: %v", lastErr)
 	}
 
-	// Resume the suspended process's primary thread
-	// Go cmd.Start() doesn't give us the main thread handle easily, but since we launched it CREATE_SUSPENDED,
-	// we need to resume it. Alternatively, if we don't launch suspended we might have a race condition,
-	// but assigning it immediately after Start() is usually fine if we don't use CREATE_SUSPENDED, 
-	// unless the malware spawns processes instantly.
-	// Since we used CREATE_SUSPENDED, let's resume the thread. How do we get the thread handle?
-	// Actually, an easier way is to not use CREATE_SUSPENDED and just assign immediately, or if we do use suspended,
-	// we resume it. In Go, to keep it simple and highly portable without thread resumption complexity:
-	// Let's launch without CREATE_SUSPENDED but in a new process group, and assign immediately.
-	// Let's rewrite the process start logic below to be simpler and not require resuming a thread.
+	// Close the write ends in the parent — child owns them via inheritance.
+	// We keep Go-level *os.File wrappers around the read ends.
+	// We also keep the write end Go files alive until Wait() to prevent
+	// the pipe from being broken before the process finishes writing.
+	// (stdoutW / stderrW are closed inside Wait())
+
+	// ── Step 4: AssignProcessToJobObject — before a single instruction runs ─
+	r1, _, lastErr = procAssignProcessToJobObject.Call(
+		uintptr(jobH),
+		uintptr(pi.Process),
+	)
+	if r1 == 0 {
+		// Assignment failed — terminate the suspended process and clean up.
+		syscall.TerminateProcess(pi.Process, 1)
+		syscall.CloseHandle(pi.Thread)
+		syscall.CloseHandle(pi.Process)
+		stdoutR.Close(); stdoutW.Close()
+		stderrR.Close(); stderrW.Close()
+		syscall.CloseHandle(jobH)
+		return nil, fmt.Errorf("AssignProcessToJobObject: %v", lastErr)
+	}
+
+	// ── Step 5: ResumeThread — process starts executing inside the job ─────
+	ret, _, lastErr := procResumeThread.Call(uintptr(pi.Thread))
+	if ret == resumeThreadError {
+		syscall.TerminateProcess(pi.Process, 1)
+		syscall.CloseHandle(pi.Thread)
+		syscall.CloseHandle(pi.Process)
+		stdoutR.Close(); stdoutW.Close()
+		stderrR.Close(); stderrW.Close()
+		syscall.CloseHandle(jobH)
+		return nil, fmt.Errorf("ResumeThread: %v", lastErr)
+	}
+
+	// Thread handle is no longer needed after resume.
+	syscall.CloseHandle(pi.Thread)
+
+	// Honour context cancellation — kill the job if ctx is cancelled.
+	go func() {
+		<-ctx.Done()
+		procTerminateJobObject.Call(uintptr(jobH), 1)
+	}()
+
 	return &WindowsJobProcess{
-		cmd:       cmd,
-		jobHandle: jobHandle,
-		stdout:    stdoutPipe,
-		stderr:    stderrPipe,
+		pid:          int(pi.ProcessID),
+		procHandle:   pi.Process,
+		jobHandle:    jobH,
+		stdoutReader: stdoutR,
+		stderrReader: stderrR,
+		stdoutWriter: stdoutW,
+		stderrWriter: stderrW,
 	}, nil
 }
 
-// In standard Go, exec.Cmd does not expose the process handle, but cmd.Process.Pid is public.
-// However, on Windows, cmd.Process contains a handle. We can get it via reflection or OpenProcess.
-// To be safe and stable, we can open the process handle using OpenProcess API.
-func getProcessHandle(p *os.Process) syscall.Handle {
-	const PROCESS_SET_QUOTA = 0x0100
-	const PROCESS_TERMINATE = 0x0001
-	h, err := syscall.OpenProcess(PROCESS_SET_QUOTA|PROCESS_TERMINATE, false, uint32(p.Pid))
-	if err != nil {
-		return 0
+// ─── Job Object helpers ───────────────────────────────────────────────────────
+
+func createJobObject() (syscall.Handle, error) {
+	r1, _, err := procCreateJobObjectW.Call(0, 0)
+	if r1 == 0 {
+		return 0, fmt.Errorf("CreateJobObjectW: %v", err)
 	}
-	return h
+	return syscall.Handle(r1), nil
+}
+
+func applyJobLimits(jobH syscall.Handle, limits Limits) error {
+	var ext jobObjectExtendedLimitInfo
+	ext.BasicLimitInformation.LimitFlags = jobLimitKillOnJobClose
+
+	if limits.MemoryLimitMB > 0 {
+		mem := uintptr(limits.MemoryLimitMB * 1024 * 1024)
+		ext.BasicLimitInformation.LimitFlags |= jobLimitJobMemory | jobLimitProcessMemory
+		ext.JobMemoryLimit = mem
+		ext.ProcessMemoryLimit = mem
+	}
+
+	if limits.MaxProcesses > 0 {
+		ext.BasicLimitInformation.LimitFlags |= jobLimitActiveProcess
+		ext.BasicLimitInformation.ActiveProcessLimit = uint32(limits.MaxProcesses)
+	}
+
+	r1, _, err := procSetInformationJobObject.Call(
+		uintptr(jobH),
+		jobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&ext)),
+		uintptr(unsafe.Sizeof(ext)),
+	)
+	if r1 == 0 {
+		return fmt.Errorf("SetInformationJobObject (extended limits): %v", err)
+	}
+
+	// CPU rate — non-fatal if unsupported (e.g. inside a nested VM without
+	// virtualisation extensions for CPU rate control).
+	if limits.CPULimitPercent > 0 && limits.CPULimitPercent < 100 {
+		cpu := jobObjectCPURateControlInfo{
+			ControlFlags: jobCPURateControlEnable | jobCPURateControlHardLimit,
+			CpuRate:      uint32(limits.CPULimitPercent * 100), // 25% → 2500
+		}
+		procSetInformationJobObject.Call(
+			uintptr(jobH),
+			jobObjectCpuRateControlInformation,
+			uintptr(unsafe.Pointer(&cpu)),
+			uintptr(unsafe.Sizeof(cpu)),
+		)
+		// Return value intentionally ignored — CPU limits degrade gracefully.
+	}
+
+	return nil
+}
+
+// ─── Pipe helpers ─────────────────────────────────────────────────────────────
+
+// newInheritablePipe creates an anonymous pipe where the write end is marked
+// inheritable so the child process can use it for stdout/stderr.
+// Returns (readEnd, writeEnd, error) as *os.File wrappers.
+func newInheritablePipe() (*os.File, *os.File, error) {
+	var rHandle, wHandle syscall.Handle
+
+	// Security attributes with bInheritHandle = TRUE for the write end.
+	sa := syscall.SecurityAttributes{
+		Length:        uint32(unsafe.Sizeof(syscall.SecurityAttributes{})),
+		InheritHandle: 1, // both ends inheritable initially
+	}
+
+	r1, _, err := procCreatePipe.Call(
+		uintptr(unsafe.Pointer(&rHandle)),
+		uintptr(unsafe.Pointer(&wHandle)),
+		uintptr(unsafe.Pointer(&sa)),
+		0, // default buffer size
+	)
+	if r1 == 0 {
+		return nil, nil, fmt.Errorf("CreatePipe: %v", err)
+	}
+
+	// Mark the read end as NOT inheritable — the parent keeps it private.
+	procSetHandleInformation.Call(
+		uintptr(rHandle),
+		handleFlagInherit,
+		0, // clear HANDLE_FLAG_INHERIT
+	)
+
+	r := os.NewFile(uintptr(rHandle), "|r")
+	w := os.NewFile(uintptr(wHandle), "|w")
+	return r, w, nil
+}
+
+// ─── Command line builder ─────────────────────────────────────────────────────
+
+// buildCommandLine constructs a properly quoted Windows command line string
+// from an executable path and argument list.
+// Each argument that contains spaces is wrapped in double-quotes.
+func buildCommandLine(exe string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, quoteArg(exe))
+	for _, a := range args {
+		parts = append(parts, quoteArg(a))
+	}
+	return strings.Join(parts, " ")
+}
+
+// quoteArg wraps an argument in double-quotes if it contains spaces or quotes,
+// escaping any embedded double-quote characters.
+func quoteArg(s string) string {
+	if !strings.ContainsAny(s, " \t\"") {
+		return s
+	}
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }
