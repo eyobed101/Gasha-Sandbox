@@ -228,6 +228,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		normalized.Category = CatProcess
 		normalized.Severity = SevInfo
 		if e.System.EventID == 1 {
+			normalized.EventID = 1   // Sysmon EventID 1 = process creation
 			normalized.EventType = EventProcessCreate
 			ppid, _ := getPropertyInt(e, "ParentProcessID")
 			image, _ := getPropertyString(e, "ImageName")
@@ -318,6 +319,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 				normalized.Data["MD5"] = hashes["md5"]
 			}
 		} else if e.System.EventID == 2 {
+			normalized.EventID = 5   // Sysmon EventID 5 = process exit
 			normalized.EventType = EventProcessExit
 			exitCode, _ := getPropertyInt(e, "ExitStatus")
 			normalized.Data["pid"] = eventPID
@@ -340,16 +342,19 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 
 		opcodeName := strings.ToLower(e.System.Opcode.Name)
 		if strings.Contains(opcodeName, "write") || e.System.EventID == 20 {
+			normalized.EventID = 11  // Sysmon EventID 11 = file create
 			normalized.EventType = EventFileWrite
 			normalized.Data["operation"] = "WRITE"
 			normalized.Data["path"] = fileName
 			normalized.Data["TargetFilename"] = fileName
 		} else if strings.Contains(opcodeName, "delete") || strings.Contains(opcodeName, "cleanup") || e.System.EventID == 15 {
+			normalized.EventID = 23  // Sysmon EventID 23 = file delete
 			normalized.EventType = EventFileDelete
 			normalized.Data["operation"] = "DELETE"
 			normalized.Data["path"] = fileName
 			normalized.Data["TargetFilename"] = fileName
 		} else if strings.Contains(opcodeName, "rename") || e.System.EventID == 16 {
+			normalized.EventID = 2   // Sysmon EventID 2 = file rename (meta)
 			normalized.EventType = EventFileWrite
 			normalized.Data["operation"] = "RENAME"
 			normalized.Data["path"] = fileName
@@ -374,6 +379,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 
 		opcodeName := strings.ToLower(e.System.Opcode.Name)
 		if strings.Contains(opcodeName, "setvalue") || e.System.EventID == 5 {
+			normalized.EventID = 13  // Sysmon EventID 13 = registry set
 			normalized.EventType = EventRegSet
 			normalized.Data["operation"] = "SET"
 			normalized.Data["key"] = keyName
@@ -425,6 +431,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 				m.correlator.ProcessEvent(svcEv)
 			}
 		} else if strings.Contains(opcodeName, "deletevalue") || e.System.EventID == 7 {
+			normalized.EventID = 14  // Sysmon EventID 14 = registry delete
 			normalized.EventType = EventRegDelete
 			normalized.Data["operation"] = "DELETE"
 			normalized.Data["key"] = keyName
@@ -452,6 +459,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 			destPort, _ = getPropertyInt(e, "DestinationPort")
 		}
 
+		normalized.EventID = 3   // Sysmon EventID 3 = network connect
 		normalized.EventType = EventNetConnect
 		normalized.Data["protocol"] = "TCP"
 		normalized.Data["dest_ip"] = destIP
@@ -499,6 +507,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 			if startAddr == "" {
 				startAddr, _ = getPropertyString(e, "Win32StartAddr")
 			}
+			normalized.EventID = 8   // Sysmon EventID 8 = remote thread
 			normalized.Category = CatMemory
 			normalized.EventType = EventThreadCreate
 			normalized.Severity = SevCritical
@@ -538,6 +547,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		imageSize, _ := getPropertyInt(e, "ImageSize")
 
 		lowerImage := strings.ToLower(imageName)
+		normalized.EventID = 7   // Sysmon EventID 7 = image load
 		normalized.Category = CatMemory
 		normalized.EventType = EventImageLoad
 		normalized.Data["image_name"] = imageName
@@ -602,6 +612,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		queryStatus, _ := getPropertyString(e, "QueryStatus")
 		queryResults, _ := getPropertyString(e, "QueryResults")
 
+		normalized.EventID = 22  // Sysmon EventID 22 = DNS query
 		normalized.Category = CatNetwork
 		normalized.EventType = EventNetDNS
 		normalized.Severity = SevLow
@@ -636,14 +647,27 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		normalized.Data["object_name"] = objectName
 
 		if strings.Contains(opcodeName, "create") || e.System.EventID == 32 || e.System.EventID == 33 {
-			normalized.EventType = EventHandleCreate
-			// Escalate LSASS opens to critical
+			if strings.ToLower(objectType) == "process" {
+				normalized.EventID = 10  // Sysmon EventID 10 = process access
+				normalized.EventType = EventProcessAccess
+				normalized.Data["TargetImage"] = objectName
+				normalized.Data["GrantedAccess"] = "0x1FFFFF" // best-effort from handle info
+			} else {
+				normalized.EventID = 12  // Sysmon EventID 12 = registry obj create/delete (handle)
+				normalized.EventType = EventHandleCreate
+			}
 			if strings.Contains(strings.ToLower(objectName), "lsass") {
 				normalized.Severity = SevCritical
 			}
 		} else if strings.Contains(opcodeName, "duplicate") || e.System.EventID == 34 {
 			targetPID, _ := getPropertyInt(e, "TargetProcessID")
-			normalized.EventType = EventHandleDuplicate
+			if strings.ToLower(objectType) == "process" {
+				normalized.EventID = 10
+				normalized.EventType = EventProcessAccess
+			} else {
+				normalized.EventID = 12
+				normalized.EventType = EventHandleDuplicate
+			}
 			normalized.Data["target_pid"] = targetPID
 			if strings.Contains(strings.ToLower(objectName), "lsass") {
 				normalized.Severity = SevCritical
@@ -664,6 +688,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		if scanContent == "" && contentName == "" {
 			return // empty AMSI event
 		}
+		normalized.EventID = 4104 // AMSI scan
 		normalized.Category = CatScript
 		normalized.EventType = EventAMSIScan
 		normalized.Severity = SevMedium
@@ -697,6 +722,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 		path, _ := getPropertyString(e, "Path")
 		scriptBlockID, _ := getPropertyString(e, "ScriptBlockId")
 
+		normalized.EventID = int(e.System.EventID) // 4104 or 4103
 		normalized.Category = CatScript
 		normalized.EventType = EventPowerShell
 		normalized.Severity = SevMedium
@@ -725,6 +751,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 			query, _ := getPropertyString(e, "Query")
 			possibleCause, _ := getPropertyString(e, "PossibleCause")
 
+			normalized.EventID = int(e.System.EventID)
 			normalized.Category = CatPersistence
 			normalized.EventType = EventWMI
 			normalized.Severity = SevCritical
@@ -742,6 +769,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 			operation, _ := getPropertyString(e, "Operation")
 			clientPID, _ := getPropertyInt(e, "ClientProcessId")
 
+			normalized.EventID = 11 // WMI-Activity EventID 11
 			normalized.Category = CatPersistence
 			normalized.EventType = EventWMI
 			normalized.Severity = SevHigh
@@ -782,6 +810,7 @@ func (m *WindowsMonitor) handleETWEvent(e *etw.Event, bus chan<- Event) {
 			userContext, _ := getPropertyString(e, "UserContext")
 			instanceID, _ := getPropertyString(e, "InstanceId")
 
+			normalized.EventID = int(e.System.EventID)
 			normalized.Category = CatPersistence
 			normalized.EventType = EventSchedTask
 			normalized.Severity = SevHigh

@@ -61,6 +61,7 @@ type compiledSigmaRule struct {
 	MITRETTP         string
 	targetCategories []string
 	targetEventTypes []string
+	targetEventIDs   []int  // EventID values this rule targets (for index)
 	// Named selector blocks indexed by name
 	selectorMap map[string]sigmaSelector
 	// Keywords block (flat string list)
@@ -105,29 +106,47 @@ const (
 	opKeywords
 )
 
-// ExternalSigmaRules is the loaded rule set.
+// ExternalSigmaRules is the loaded rule set with a pre-filter index.
 type ExternalSigmaRules struct {
 	rules []compiledSigmaRule
+	// indexByEventType maps EventID → rules that can match that event.
+	// Rules without a specific scope match all events.
+	indexByEventType map[int][]int // EventID → rule indices
+	unscoped         []int         // rule indices with no scope restriction
 }
 
 // ─── Logsource mapping ───────────────────────────────────────────────────────
 
 var logsourceCategoryMap = map[string][]string{
-	"process_creation":     {monitor.CatProcess, monitor.EventProcessCreate},
-	"process":              {monitor.CatProcess},
-	"file_event":           {monitor.CatFile, monitor.EventFileWrite},
-	"file_change":          {monitor.CatFile, monitor.EventFileWrite},
-	"file_delete":          {monitor.CatFile, monitor.EventFileDelete},
-	"registry_event":       {monitor.CatRegistry, monitor.EventRegSet},
-	"registry_add":         {monitor.CatRegistry, monitor.EventRegSet},
-	"registry_set":         {monitor.CatRegistry, monitor.EventRegSet},
-	"network_connection":   {monitor.CatNetwork, monitor.EventNetConnect},
-	"dns_query":            {monitor.CatNetwork, monitor.EventNetDNS},
-	"ps_script":            {monitor.CatScript, monitor.EventPowerShell},
-	"powershell":           {monitor.CatScript, monitor.EventPowerShell},
-	"create_remote_thread": {monitor.CatAPI, monitor.EventThreadCreate},
-	"image_load":           {monitor.CatMemory, monitor.EventImageLoad},
-	"driver_load":          {monitor.CatMemory, monitor.EventImageLoad},
+	"process_creation":         {monitor.CatProcess, monitor.EventProcessCreate},
+	"process":                  {monitor.CatProcess},
+	"process_access":           {monitor.CatProcess, monitor.EventProcessAccess},
+	"file_event":               {monitor.CatFile, monitor.EventFileWrite},
+	"file_change":              {monitor.CatFile, monitor.EventFileWrite},
+	"file_delete":              {monitor.CatFile, monitor.EventFileDelete},
+	"file_access":              {monitor.CatFile, monitor.EventFileWrite},
+	"file_executable_detected": {monitor.CatFile, monitor.EventFileWrite},
+	"file_rename":              {monitor.CatFile, monitor.EventFileWrite},
+	"registry_event":           {monitor.CatRegistry, monitor.EventRegSet},
+	"registry_add":             {monitor.CatRegistry, monitor.EventRegSet},
+	"registry_set":             {monitor.CatRegistry, monitor.EventRegSet},
+	"registry_delete":          {monitor.CatRegistry, monitor.EventRegDelete},
+	"network_connection":       {monitor.CatNetwork, monitor.EventNetConnect},
+	"dns_query":                {monitor.CatNetwork, monitor.EventNetDNS},
+	"ps_script":                {monitor.CatScript, monitor.EventPowerShell},
+	"powershell":               {monitor.CatScript, monitor.EventPowerShell},
+	"ps_module":                {monitor.CatScript, monitor.EventPowerShell},
+	"create_remote_thread":     {monitor.CatMemory, monitor.EventThreadCreate},
+	"image_load":               {monitor.CatMemory, monitor.EventImageLoad},
+	"driver_load":              {monitor.CatMemory, monitor.EventImageLoad},
+	"wmi_event":                {monitor.CatPersistence, monitor.EventWMI},
+	"process_tampering":        {monitor.CatMemory, monitor.EventThreadCreate},
+	"pipe_created":             {monitor.CatFile, monitor.EventFileWrite},
+	"raw_access_thread":        {monitor.CatAPI, monitor.EventAPICall},
+	"file":                     {monitor.CatFile},
+	"registry":                 {monitor.CatRegistry},
+	"network":                  {monitor.CatNetwork},
+	"process_termination":      {monitor.CatProcess, monitor.EventProcessExit},
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -162,16 +181,58 @@ func LoadSigmaRules(dir string) (*ExternalSigmaRules, []error) {
 			out.rules = append(out.rules, *rule)
 		}
 	}
+	out.buildIndex()
 	return &out, errs
 }
 
-// Evaluate runs all loaded external Sigma rules against a single event.
-func (es *ExternalSigmaRules) Evaluate(ev monitor.Event) []RuleHit {
-	var hits []RuleHit
-	for _, rule := range es.rules {
-		if !rule.matchesScope(ev) {
+// buildIndex populates the pre-filter index for faster evaluation.
+func (es *ExternalSigmaRules) buildIndex() {
+	es.indexByEventType = make(map[int][]int)
+	for idx, rule := range es.rules {
+		if len(rule.targetEventIDs) == 0 && len(rule.targetCategories) == 0 && len(rule.targetEventTypes) == 0 {
+			es.unscoped = append(es.unscoped, idx)
 			continue
 		}
+		if len(rule.targetEventIDs) > 0 {
+			for _, eid := range rule.targetEventIDs {
+				es.indexByEventType[eid] = append(es.indexByEventType[eid], idx)
+			}
+		}
+	}
+}
+
+// Evaluate runs all loaded external Sigma rules against a single event.
+// Uses the pre-filter index to skip scoped rules that can't match this event.
+func (es *ExternalSigmaRules) Evaluate(ev monitor.Event) []RuleHit {
+	var hits []RuleHit
+
+	// Collect candidate rule indices from the index
+	candidates := make(map[int]bool)
+
+	// Unscoped rules (no logsource) always run
+	for _, idx := range es.unscoped {
+		candidates[idx] = true
+	}
+
+	// EventID-indexed rules
+	if ev.EventID > 0 {
+		for _, idx := range es.indexByEventType[ev.EventID] {
+			candidates[idx] = true
+		}
+	}
+
+	// Rules that match by scope but weren't in the EventID index
+	for idx, rule := range es.rules {
+		if candidates[idx] {
+			continue
+		}
+		if rule.matchesScope(ev) {
+			candidates[idx] = true
+		}
+	}
+
+	for idx := range candidates {
+		rule := es.rules[idx]
 		if rule.matches(ev) {
 			hits = append(hits, RuleHit{
 				RuleName:    rule.Name,
@@ -190,8 +251,13 @@ func (es *ExternalSigmaRules) Evaluate(ev monitor.Event) []RuleHit {
 // ─── Scope check ─────────────────────────────────────────────────────────────
 
 func (r *compiledSigmaRule) matchesScope(ev monitor.Event) bool {
-	if len(r.targetCategories) == 0 && len(r.targetEventTypes) == 0 {
+	if len(r.targetCategories) == 0 && len(r.targetEventTypes) == 0 && len(r.targetEventIDs) == 0 {
 		return true
+	}
+	for _, eid := range r.targetEventIDs {
+		if ev.EventID == eid {
+			return true
+		}
 	}
 	for _, c := range r.targetCategories {
 		if ev.Category == c || ev.EventType == c {
@@ -381,6 +447,19 @@ func extractField(field string, ev monitor.Event) string {
 		"processguid":          "process_guid",
 		"parentprocessguid":    "parent_process_guid",
 		"logonid":              "logon_id",
+		"sourceimage":          "source_image",
+		"targetimage":          "target_image",
+		"servicefilename":      "service_file",
+		"servicename":          "service_name",
+		"taskname":             "task_name",
+		"usercontext":          "user_context",
+		"wmi_query":            "wmi_query",
+		"wmi_consumer":         "wmi_consumer",
+		"grantedaccess":        "access_mask",
+		"calltrace":            "call_stack",
+		"initiated":            "outbound",
+		"imagepath":            "service_imagepath",
+		"imphash":              "imphash",
 	}
 	if mapped, ok := aliases[lf]; ok {
 		for k, v := range ev.Data {
@@ -390,6 +469,11 @@ func extractField(field string, ev monitor.Event) string {
 		}
 	}
 	switch lf {
+	case "eventid", "event_id":
+		if ev.EventID > 0 {
+			return fmt.Sprintf("%d", ev.EventID)
+		}
+		return ""
 	case "pid":
 		return fmt.Sprintf("%d", ev.PID)
 	case "event_type", "eventtype":
@@ -483,7 +567,28 @@ func parseSigmaFile(path string) (*compiledSigmaRule, error) {
 	return rule, nil
 }
 
+var logsourceEventIDMap = map[string][]int{
+	"process_creation":         {1},
+	"process_termination":      {5},
+	"network_connection":       {3},
+	"dns_query":                {22},
+	"file_event":               {11},
+	"file_delete":              {23},
+	"registry_set":             {13},
+	"registry_delete":          {14},
+	"image_load":               {7},
+	"create_remote_thread":     {8},
+	"process_access":           {10},
+	"driver_load":              {7},
+	"wmi_event":                {5860, 5861, 11},
+	"powershell":               {4104, 4103},
+	"ps_script":                {4104, 4103},
+}
+
 func applyLogsource(rule *compiledSigmaRule, ls sigmaLogsource) {
+	if eids, ok := logsourceEventIDMap[strings.ToLower(ls.Category)]; ok {
+		rule.targetEventIDs = append(rule.targetEventIDs, eids...)
+	}
 	if mappings, ok := logsourceCategoryMap[strings.ToLower(ls.Category)]; ok {
 		for _, m := range mappings {
 			// Heuristic: event type constants contain "_" and are not pure category names

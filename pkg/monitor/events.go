@@ -31,6 +31,8 @@ const (
 	EventWMI            = "wmi_activity"        // T1047  WMI execution / event subscription
 	EventSchedTask      = "scheduled_task"       // T1053.005 Scheduled task created/modified
 	EventServiceInstall = "service_install"      // T1543.003 Windows service installed/modified
+	// Process access — handle open to another process (e.g. LSASS)
+	EventProcessAccess  = "process_access"       // T1003.001, T1055
 )
 
 // Categories
@@ -61,6 +63,7 @@ type Event struct {
 	JobID     string                 `json:"job_id"`
 	Timestamp time.Time              `json:"timestamp"`
 	EventType string                 `json:"event_type"`
+	EventID   int                    `json:"event_id,omitempty"` // Sysmon/Windows Event Log ID for Sigma matching
 	PID       int                    `json:"pid"`
 	TID       int                    `json:"tid,omitempty"`
 	Category  string                 `json:"category"`

@@ -369,6 +369,7 @@ func emitMemoryEvent(jobID string, pid int, f MemoryFinding, bus chan<- Event) {
 	ev := Event{
 		JobID:     jobID,
 		Timestamp: time.Now(),
+		EventID:   7, // Sysmon EventID 7 = image load
 		EventType: EventImageLoad,
 		PID:       pid,
 		Category:  CatMemory,
