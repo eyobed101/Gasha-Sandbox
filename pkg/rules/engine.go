@@ -9,13 +9,14 @@ import (
 
 // RuleHit represents a detection signature match from YARA or Sigma.
 type RuleHit struct {
-	RuleName    string `json:"rule_name"`
-	Engine      string `json:"engine"`      // "yara", "yara-external", "sigma", "sigma-external"
-	Description string `json:"description"`
-	Severity    string `json:"severity"`    // "informational", "low", "medium", "high", "critical"
-	MITRETTP    string `json:"mitre_ttp"`   // e.g. "T1055.001"
-	MatchedOn   string `json:"matched_on"`  // context of match (file path, api param, etc.)
-	Evidence    string `json:"evidence"`    // extracted proof
+	RuleName    string            `json:"rule_name"`
+	Engine      string            `json:"engine"`      // "yara", "yara-external", "sigma", "sigma-external"
+	Description string            `json:"description"`
+	Severity    string            `json:"severity"`    // "informational", "low", "medium", "high", "critical"
+	MITRETTP    string            `json:"mitre_ttp"`   // e.g. "T1055.001"
+	MatchedOn   string            `json:"matched_on"`  // context of match (file path, api param, etc.)
+	Evidence    string            `json:"evidence"`    // extracted proof
+	Meta        map[string]string `json:"meta,omitempty"` // all meta key=value pairs from the rule
 }
 
 // Engine aggregates the YARA and Sigma detection pipelines.

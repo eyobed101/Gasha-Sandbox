@@ -60,6 +60,7 @@ type ExternalYaraRule struct {
 	Description string
 	Severity    string
 	MITRETTP    string
+	LemasFamily string   // lemas_family meta — drives config extractor dispatch
 	Tags        []string
 	patterns    []yaraPattern
 	condition   yaraCondition
@@ -152,6 +153,10 @@ func (ey *ExternalYaraRules) match(data []byte, label string) []RuleHit {
 
 		triggered, evidence := evalCondition(rule.condition, rule.patterns, matchSet)
 		if triggered {
+			meta := make(map[string]string, 1)
+			if rule.LemasFamily != "" {
+				meta["lemas_family"] = rule.LemasFamily
+			}
 			hits = append(hits, RuleHit{
 				RuleName:    rule.Name,
 				Engine:      "yara-external",
@@ -160,6 +165,7 @@ func (ey *ExternalYaraRules) match(data []byte, label string) []RuleHit {
 				MITRETTP:    rule.MITRETTP,
 				MatchedOn:   label,
 				Evidence:    "Matched: " + evidence,
+				Meta:        meta,
 			})
 		}
 	}
@@ -520,6 +526,8 @@ func parseMetaLine(line string, rule *ExternalYaraRule) {
 		rule.Severity = normaliseSeverity(val)
 	case "mitre", "mitre_ttp", "attack_id", "technique":
 		rule.MITRETTP = val
+	case "lemas_family":
+		rule.LemasFamily = val
 	}
 }
 

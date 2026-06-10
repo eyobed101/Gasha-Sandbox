@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/lemas-sandbox/lemas/pkg/extractor"
 	"github.com/lemas-sandbox/lemas/pkg/peparser"
 )
 
@@ -18,7 +19,6 @@ type YaraScanner struct {
 func NewYaraScanner(rulesDir string) (*YaraScanner, error) {
 	ext, loadErrs := LoadYaraRules(rulesDir)
 	for _, e := range loadErrs {
-		// Log parse errors but don't fail — built-in rules still work.
 		_ = e
 	}
 	return &YaraScanner{rulesDir: rulesDir, externalRules: ext}, nil
@@ -52,11 +52,11 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 	if err != nil {
 		return hits
 	}
+
 	// 1. Check for executable headers
 	isPE := len(data) > 2 && data[0] == 'M' && data[1] == 'Z'
 
 	if isPE {
-		// Calculate whole-file entropy (fast pre-check)
 		entropy := CalculateEntropy(data)
 		if entropy > 7.2 {
 			hits = append(hits, RuleHit{
@@ -70,7 +70,6 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 			})
 		}
 
-		// Deep PE analysis via saferwall/pe — malformation-tolerant, richer than debug/pe
 		peResult, err := peparser.Analyze(path)
 		if err == nil && peResult != nil {
 			for _, h := range peResult.Hits {
@@ -132,7 +131,6 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 		}
 	}
 
-	// Also scan for dropped scripts/extensions in filename
 	ext := filepath.Ext(path)
 	if ext == ".vbs" || ext == ".ps1" || ext == ".bat" {
 		hits = append(hits, RuleHit{
@@ -146,7 +144,6 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 		})
 	}
 
-	// External .yar rules
 	if y.externalRules != nil {
 		hits = append(hits, y.externalRules.MatchFile(path, data)...)
 	}
@@ -158,7 +155,6 @@ func (y *YaraScanner) ScanFile(path string) []RuleHit {
 func (y *YaraScanner) ScanMemory(pid int, address string, data []byte) []RuleHit {
 	var hits []RuleHit
 
-	// Check if MZ header is present in unbacked heap memory
 	if len(data) > 2 && data[0] == 'M' && data[1] == 'Z' {
 		hits = append(hits, RuleHit{
 			RuleName:    "UnbackedPEHeaderInMemory",
@@ -171,7 +167,6 @@ func (y *YaraScanner) ScanMemory(pid int, address string, data []byte) []RuleHit
 		})
 	}
 
-	// Check entropy of memory region
 	entropy := CalculateEntropy(data)
 	if len(data) > 4096 && entropy > 7.4 {
 		hits = append(hits, RuleHit{
@@ -185,7 +180,6 @@ func (y *YaraScanner) ScanMemory(pid int, address string, data []byte) []RuleHit
 		})
 	}
 
-	// Simple string scans on dumped pages
 	if bytes.Contains(data, []byte("mimikatz")) {
 		hits = append(hits, RuleHit{
 			RuleName:    "MimikatzFoundInMemory",
@@ -198,10 +192,27 @@ func (y *YaraScanner) ScanMemory(pid int, address string, data []byte) []RuleHit
 		})
 	}
 
-	// External .yar rules
 	if y.externalRules != nil {
 		hits = append(hits, y.externalRules.MatchMemory(pid, address, data)...)
 	}
 
 	return hits
+}
+
+// ToYARAHits converts RuleHits from the YARA scanner into extractor.YARAHits
+// suitable for the config extractor trigger layer. Only hits with lemas_family
+// meta are included.
+func ToYARAHits(ruleHits []RuleHit) []extractor.YARAHit {
+	var out []extractor.YARAHit
+	for _, h := range ruleHits {
+		if h.Meta == nil || h.Meta["lemas_family"] == "" {
+			continue
+		}
+		out = append(out, extractor.YARAHit{
+			RuleName:  h.RuleName,
+			Meta:      h.Meta,
+			MatchedOn: h.MatchedOn,
+		})
+	}
+	return out
 }
