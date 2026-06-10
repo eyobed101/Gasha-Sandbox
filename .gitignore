@@ -1,3 +1,7 @@
 lemas.exe
 malicious_test_sample.exe
 reports/*
+# Downloaded SigmaHQ ruleset — too large for version control, regenerate with
+#   git clone --depth 1 https://github.com/SigmaHQ/sigma.git tmp/sigma-repo
+#   cp tmp/sigma-repo/rules/**/*.yml rules/sigma/
+rules/sigma/
